@@ -4,6 +4,7 @@ from math import ceil, sqrt, acos, sin, cos
 import numpy as np
 from scipy.spatial import cKDTree
 import numpy as np
+import os, subprocess
 
 
 class DiamondSphereGenerator:
@@ -187,11 +188,77 @@ def hydrogen_functionalization(gen, r_angstrom, bond_tol=0.2):
     return gen
 
 
+def add_water_shell(gen, r_angstrom, N_H2O=150, water_xyz_path=None):
+    L = 4.0 * float(r_angstrom)
+    buffer = 1.0
+    core_xyz_path = "core_np.xyz"
+    combined_xyz_path = "diamond_with_water_full.xyz"
+    packmol_input_path = "packmol.inp"
+
+    # Create core NP file
+    with open(core_xyz_path, "w") as f:
+        f.write(gen.to_xyz(r_angstrom))
+
+    # Auto-generate water.xyz if not provided
+    if water_xyz_path is None:
+        water_xyz_path = "water.xyz"
+        if not os.path.exists(water_xyz_path):
+            with open(water_xyz_path, "w") as f:
+                f.write("""3
+Water
+O  0.000  0.000  0.000
+H  0.757  0.586  0.000
+H -0.757  0.586  0.000
+""")
+
+    # Write Packmol input
+    with open(packmol_input_path, "w") as f:
+        f.write(f"""tolerance 2.0
+filetype xyz
+output {combined_xyz_path}
+
+structure {core_xyz_path}
+  number 1
+  fixed 0. 0. 0. 0. 0. 0.
+end structure
+
+structure {water_xyz_path}
+  number {N_H2O}
+  inside box {-L/2 + buffer} {-L/2 + buffer} {-L/2 + buffer} {L/2 - buffer} {L/2 - buffer} {L/2 - buffer}
+  outside sphere 0.0 0.0 0.0 {r_angstrom + buffer}
+end structure
+""")
+
+    with open(packmol_input_path) as inp:
+        subprocess.run(["packmol"], stdin=inp, check=True)
+
+    with open(combined_xyz_path) as f:
+        lines = f.readlines()
+
+    # Determine number of atoms in core NP from gen.to_xyz
+    core_np_atoms = len(gen.to_xyz(r_angstrom).splitlines()) - 2  # skip count and header
+    atom_lines = lines[2:]
+    water_lines = atom_lines[core_np_atoms:]
+    
+    water_atoms = []
+    for line in water_lines:
+        sym, x, y, z = line.strip().split()
+        water_atoms.append((sym, float(x), float(y), float(z)))
+    
+    print(f"Parsed {len(water_atoms)//3} water molecules from Packmol output.")
+    
+    gen._extra_atoms = gen._extra_atoms + water_atoms if hasattr(gen, "_extra_atoms") else water_atoms
+    return gen
+
 if __name__ == "__main__":
     import sys
     r = float(sys.argv[1])
+    N = int(sys.argv[2])  # number of water molecules
+
     gen = DiamondSphereGenerator(a_angstrom=3.567)
     gen = hydrogen_functionalization(gen, r)
-    with open("diamond.xyz", "w") as f:
+    gen = add_water_shell(gen, r, N_H2O=N)
+
+    with open("diamond_with_water.xyz", "w") as f:
         f.write(gen.to_xyz(r, rotate_111_to_z=True, NV_vacancy=True))
 
