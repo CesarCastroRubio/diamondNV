@@ -142,7 +142,7 @@ def hydrogen_functionalization(gen, r_angstrom, bond_tol=0.2):
 
 def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
                                    ratio_OH_to_O=4.0,
-                                   temperature=0.6):
+                                   temperature=1.0):
     """
     Mixed hydroxyl/ether oxygen functionalization (Galli et al. 2024 model)
 
@@ -172,6 +172,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     target_OH = int(base_fraction * n_total * scale_factor)
     target_OH = max(3, min(target_OH, len(under_idx)))
 
+
     new_atoms = []
     OH_sites, O_sites = set(), set()
 
@@ -179,19 +180,155 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     weights = np.exp(-(C_SP3 - ncoord[under_idx]) / max(temperature, 1e-3))
     weights /= np.sum(weights)
 
-    # --- Step 1: Hydroxylate undercoordinated carbons ---
-    chosen_OH = np.random.choice(under_idx,
-                                 size=min(target_OH, len(under_idx)),
-                                 replace=False,
-                                 p=weights)
-    for idx in chosen_OH:
+    # --- steric overlap helper ---
+    MIN_DIST_CH = 1.0
+    MIN_DIST_CO = 1.3
+    MIN_DIST_HH = 1.0
+    MIN_DIST_HO = 1.3
+    MIN_DIST_OO = 1.4
+
+    def too_close(new_xyz, sym, existing):
+        """Return True if new atom (sym, new_xyz) is too close to any existing atom."""
+        for s, x, y, z in existing:
+            d = np.linalg.norm(new_xyz - np.array([x, y, z]))
+            if d < 0.5:                     # absolute guardrail
+                return True
+            if s == "C" and sym == "H" and d < MIN_DIST_CH:
+                return True
+            if s == "C" and sym == "O" and d < MIN_DIST_CO:
+                return True
+            if s == "H" and sym == "H" and d < MIN_DIST_HH:
+                return True
+            if (s, sym) in [("H", "O"), ("O", "H")] and d < MIN_DIST_HO:
+                return True
+            if s == "O" and sym == "O" and d < MIN_DIST_OO:
+                return True
+        return False
+
+    # Preload coordinates of existing framework atoms
+    base_atoms = [("C", *c) for c in coords]
+    existing = list(base_atoms) + new_atoms  # update dynamically as new atoms are added
+
+    # --- Step 1: Hydroxylate undercoordinated carbons (local geometry) ---
+    capped_idx = set()
+    OH_sites = set()
+    count_OH = 0
+
+    for idx in under_idx:
+        if idx in capped_idx:
+            continue
+
         pos = coords[idx]
-        rvec = pos / np.linalg.norm(pos)
-        O_pos = pos + BOND_CO * rvec
-        H_pos = O_pos + BOND_OH * rvec
+        neigh = [n for n in bonded[idx] if n != idx]
+        n = len(neigh)
+        if n >= 4:
+            continue
+        if n == 0:
+            print(f"[Warning] Atom {idx} has zero coordination — skipping hydroxylation.")
+            continue
+
+        # --- build normalized neighbor vectors ---
+        neigh_vecs = []
+        for j in neigh:
+            v = coords[j] - pos
+            norm = np.linalg.norm(v)
+            if norm > 1e-6:
+                neigh_vecs.append(v / norm)
+        neigh_vecs = np.array(neigh_vecs)
+
+        rvec = pos / np.linalg.norm(pos)  # outward
+        need = 4 - n
+        missing_dirs = []
+
+        if n == 3:
+            # one missing tetrahedral direction opposite plane of 3 bonds
+            normal = np.cross(neigh_vecs[0] - neigh_vecs[1],
+                              neigh_vecs[0] - neigh_vecs[2])
+            if np.linalg.norm(normal) < 1e-6:
+                normal = -np.sum(neigh_vecs, axis=0)
+            normal /= np.linalg.norm(normal)
+            if np.dot(normal, rvec) < 0:
+                normal = -normal
+            missing_dirs = [normal]
+
+        elif n == 2:
+            continue
+            # two missing directions roughly tetrahedral to 2 neighbors
+            u, v = neigh_vecs
+            cross = np.cross(u, v)
+            cross /= np.linalg.norm(cross)
+            bis = (u + v)
+            bis /= np.linalg.norm(bis)
+            theta = np.deg2rad(109.5 / 2)
+            d1 = -np.cos(theta) * bis + np.sin(theta) * cross
+            d2 = -np.cos(theta) * bis - np.sin(theta) * cross
+            if np.dot((d1 + d2) / 2, rvec) < 0:
+                d1, d2 = -d1, -d2
+            missing_dirs = [d1, d2]
+
+        elif n == 1:
+            # three directions around single bond
+            a = neigh_vecs[0]
+            tmp = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(a, tmp)) > 0.9:
+                tmp = np.array([0.0, 1.0, 0.0])
+            x = np.cross(a, tmp); x /= np.linalg.norm(x)
+            y = np.cross(a, x)
+            theta = np.deg2rad(109.5)
+            dirs = []
+            for phi in [0, 120, 240]:
+                phi = np.deg2rad(phi)
+                dirs.append(-np.cos(theta) * a +
+                            np.sin(theta) * (np.cos(phi) * x + np.sin(phi) * y))
+            mean_dir = np.mean(dirs, axis=0)
+            if np.dot(mean_dir, rvec) < 0:
+                dirs = [-d for d in dirs]
+            missing_dirs = dirs
+
+        if len(missing_dirs) == 0:
+            continue
+
+        # --- choose one missing direction for O ---
+        O_dir = missing_dirs[0]
+        H_dirs = missing_dirs[1:]
+        O_pos = pos + BOND_CO * O_dir
+        if too_close(O_pos, "O", existing):
+            continue
+
+        # --- place hydrogens on other missing directions ---
+        for d in H_dirs:
+            H_pos = pos + BOND_CH * d
+            if not too_close(H_pos, "H", existing):
+                new_atoms.append(("H", *H_pos))
+                existing.append(("H", *H_pos))
+
+        # --- attach hydroxyl H with proper 104.5° C–O–H angle ---
+        theta = np.deg2rad(104.5)
+        tmp = np.random.randn(3)
+        x = np.cross(O_dir, tmp)
+        if np.linalg.norm(x) < 1e-6:
+            tmp = np.array([1, 0, 0])
+            x = np.cross(O_dir, tmp)
+        x /= np.linalg.norm(x)
+        y = np.cross(O_dir, x)
+        phi = np.random.uniform(0, 2 * np.pi)
+        rot_dir = np.cos(theta) * (-O_dir) + np.sin(theta) * (np.cos(phi) * x + np.sin(phi) * y)
+        rot_dir /= np.linalg.norm(rot_dir)
+        H_pos = O_pos + BOND_OH * rot_dir
+
+        if too_close(H_pos, "H", existing):
+            continue
+
         new_atoms.append(("O", *O_pos))
         new_atoms.append(("H", *H_pos))
+        existing.append(("O", *O_pos))
+        existing.append(("H", *H_pos))
         OH_sites.add(idx)
+        count_OH += 1
+        if count_OH >= target_OH:
+            print(f"[Info] Reached target OH count ({target_OH}); stopping hydroxylation.")
+            break
+
 
     # --- Step 2: choose subset of 2-coordinated Cs to convert to O ---
     two_coord_idx = [i for i in under_idx if ncoord[i] == 2 and i not in OH_sites]
@@ -209,18 +346,97 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
 
     # --- Step 3: hydrogen cap remaining ---
     capped_idx = OH_sites | O_sites
+
     for idx in under_idx:
         if idx in capped_idx:
             continue
+
         pos = coords[idx]
         neigh = [n for n in bonded[idx] if n != idx]
         n = len(neigh)
         if n >= 4:
             continue
-        missing = 4 - n
+        if n == 0:
+            print(f"[Warning] Atom {idx} has zero coordination — skipping hydrogenation.")
+            continue
+
+        # --- build normalized neighbor vectors ---
+        neigh_vecs = []
+        for j in neigh:
+            v = coords[j] - pos
+            norm = np.linalg.norm(v)
+            if norm > 1e-6:
+                neigh_vecs.append(v / norm)
+        neigh_vecs = np.array(neigh_vecs)
+
+        # outward direction (from NP center)
         rvec = pos / np.linalg.norm(pos)
-        for _ in range(missing):
-            H_pos = pos + BOND_CH * rvec
+
+        # --- local tetrahedral completion ---
+        # For sp3 geometry, the missing bond directions can be approximated
+        # by vectors that minimize the dot product with existing bonds
+        # under the constraint of tetrahedral angle (~109.5°)
+        need = 4 - n
+        missing_dirs = []
+
+        if n == 3:
+            # single hydrogen opposite to the plane formed by three neighbors
+            normal = np.cross(neigh_vecs[0] - neigh_vecs[1],
+                              neigh_vecs[0] - neigh_vecs[2])
+            if np.linalg.norm(normal) < 1e-6:
+                normal = -np.sum(neigh_vecs, axis=0)
+            normal /= np.linalg.norm(normal)
+            # flip outward if needed
+            if np.dot(normal, rvec) < 0:
+                normal = -normal
+            missing_dirs = [normal]
+
+        elif n == 2:
+            # two hydrogens roughly tetrahedral to two neighbors
+            # find vector perpendicular to neighbor plane
+            u = neigh_vecs[0]
+            v = neigh_vecs[1]
+            cross = np.cross(u, v)
+            cross /= np.linalg.norm(cross)
+            # bisector direction of neighbors
+            bis = (u + v)
+            bis /= np.linalg.norm(bis)
+            # tetrahedral angle offset (~109.5°)
+            theta = np.deg2rad(109.5 / 2)
+            d1 = -np.cos(theta) * bis + np.sin(theta) * cross
+            d2 = -np.cos(theta) * bis - np.sin(theta) * cross
+            # orient both outward
+            if np.dot((d1 + d2) / 2, rvec) < 0:
+                d1, d2 = -d1, -d2
+            missing_dirs = [d1, d2]
+
+        elif n == 1:
+            # three Hs forming CH3 group around single bond
+            a = neigh_vecs[0]
+            # generate orthonormal basis perpendicular to a
+            tmp = np.array([1.0, 0.0, 0.0])
+            if abs(np.dot(a, tmp)) > 0.9:
+                tmp = np.array([0.0, 1.0, 0.0])
+            x = np.cross(a, tmp)
+            x /= np.linalg.norm(x)
+            y = np.cross(a, x)
+            # three directions rotated by 120° around a
+            theta = np.deg2rad(109.5)
+            dirs = []
+            for phi in [0, 120, 240]:
+                phi = np.deg2rad(phi)
+                dirs.append(-np.cos(theta) * a +
+                            np.sin(theta) * (np.cos(phi) * x + np.sin(phi) * y))
+            # orient outward
+            mean_dir = np.mean(dirs, axis=0)
+            if np.dot(mean_dir, rvec) < 0:
+                dirs = [-d for d in dirs]
+            missing_dirs = dirs
+
+        # --- place hydrogens ---
+        for d in missing_dirs:
+            d /= np.linalg.norm(d)
+            H_pos = pos + BOND_CH * d
             new_atoms.append(("H", *H_pos))
 
     # --- record replacements permanently ---
