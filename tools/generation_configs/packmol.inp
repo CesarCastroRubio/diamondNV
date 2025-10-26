@@ -1,14 +1,14 @@
 tolerance 2.0
 filetype xyz
-output diamond_with_water.xyz
+output diamond_water.xyz
 
-structure core_np.xyz
+structure diamond_np.xyz
   number 1
   fixed 0. 0. 0. 0. 0. 0.
 end structure
 
 structure water.xyz
-  number 885
-  inside box -14.0 -14.0 -14.0 14.0 14.0 14.0
-  outside sphere 0.0 0.0 0.0 6.0
+  number 709
+  inside box -13.0625 -13.0625 -13.0625 13.0625 13.0625 13.0625
+  outside sphere 0.0 0.0 0.0 7.25
 end structure
