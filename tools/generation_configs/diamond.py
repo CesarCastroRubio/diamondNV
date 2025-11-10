@@ -98,7 +98,7 @@ class DiamondSphereGenerator:
 
 def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
                                    ratio_OH_to_O=4.0,
-                                   temperature=1.0):
+                                   temperature=100.0):
     """
     Mixed hydroxyl/ether oxygen functionalization (reordered + minimal steric model)
 
@@ -148,6 +148,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
             gen._replacements[idx] = "O"
 
     # === Step 2: hydrogenation (no steric checks) ===
+    count_H = 0
     for idx in under_idx:
         if idx in gen._replacements:
             continue
@@ -179,6 +180,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
             if np.dot(normal, rvec) < 0:
                 normal = -normal
             missing_dirs = [normal]
+            count_H += 1
         elif n == 2:
             u, v = neigh_vecs
             cross = np.cross(u, v)
@@ -191,6 +193,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
             if np.dot((d1 + d2) / 2, rvec) < 0:
                 d1, d2 = -d1, -d2
             missing_dirs = [d1, d2]
+            count_H += 2
         elif n == 1:
             a = neigh_vecs[0]
             tmp = np.array([1.0, 0.0, 0.0])
@@ -209,6 +212,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
             if np.dot(mean_dir, rvec) < 0:
                 dirs = [-d for d in dirs]
             missing_dirs = dirs
+            count_H += 3
 
         for d in missing_dirs:
             H_pos = pos + BOND_CH * d / np.linalg.norm(d)
@@ -246,7 +250,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
             if np.allclose([x, y, z], H_xyz, atol=1e-3):
                 continue
             d = np.linalg.norm(O_pos - np.array([x, y, z]))
-            if (s == "H" and d < 0.6) or (s == "O" and d < 1.3):
+            if (s == "H" and d < 1.0) or (s == "O" and d < 1.2):
                 too_close_flag = True
                 break
         if too_close_flag:
@@ -295,9 +299,10 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
 
     # === finalize ===
     gen._extra_atoms = getattr(gen, "_extra_atoms", []) + new_atoms
-    print(f"Inserted {len(chosen_O)} bridging O and {count_OH} OH groups "
+    print(f"Inserted {len(chosen_O)} bridging O groups, {count_OH} OH groups, and {count_H-count_OH} hydrogens "
           f"out of {len(under_idx)} possible undercoordinated sites.")
     print("Printing Core:")
+    print(f"C{n_total-2-len(chosen_O)} H{count_H-count_OH} (OH){count_OH} O{len(chosen_O)} N")
     return gen
 
 
@@ -385,7 +390,7 @@ if __name__ == "__main__":
         print("Usage: python diamond.py <diameter_angstrom> <num_water_molecules>")
         sys.exit(1)
 
-    gen = DiamondSphereGenerator(3.567)
+    gen = DiamondSphereGenerator()
     gen = oxygen_mixed_functionalization(gen, r)
     gen = add_water_shell(gen, r)
     print("Printing Total System:")

@@ -8,7 +8,7 @@ structure diamond_np.xyz
 end structure
 
 structure water.xyz
-  number 709
-  inside box -13.0625 -13.0625 -13.0625 13.0625 13.0625 13.0625
-  outside sphere 0.0 0.0 0.0 7.25
+  number 363
+  inside box -10.25 -10.25 -10.25 10.25 10.25 10.25
+  outside sphere 0.0 0.0 0.0 6.0
 end structure
