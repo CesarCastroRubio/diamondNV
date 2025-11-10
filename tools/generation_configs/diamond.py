@@ -58,6 +58,8 @@ class DiamondSphereGenerator:
         labeled = []
         for i, (x, y, z) in enumerate(atoms):
             sym = "C"
+            if hasattr(self, "_surface_idx") and i in self._surface_idx:
+                sym = "CS"
             if hasattr(self, "_replacements"):
                 sym = self._replacements.get(i, sym)
             labeled.append((sym, x, y, z))
@@ -122,6 +124,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     bonded = tree.query_ball_tree(tree, BOND_CC + bond_tol)
     ncoord = np.array([len(neigh) - 1 for neigh in bonded])
     under_idx = np.where(ncoord < C_SP3)[0]
+    gen._surface_idx = set(under_idx)
     n_total = len(coords)
 
     base_fraction = 25 / 67
@@ -145,7 +148,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
                                     size=min(target_O, len(two_coord_idx)),
                                     replace=False, p=weights_O)
         for idx in chosen_O:
-            gen._replacements[idx] = "O"
+            gen._replacements[idx] = "OS"
 
     # === Step 2: hydrogenation (no steric checks) ===
     count_H = 0
@@ -375,6 +378,10 @@ end structure
     water_atoms = []
     for line in water_lines:
         sym, x, y, z = line.strip().split()
+        if sym == "O":
+            sym = "OW"
+        elif sym == "H":
+            sym = "HW"
         water_atoms.append((sym, float(x), float(y), float(z)))
 
     print(f"Parsed {len(water_atoms)//3} water molecules ({len(water_atoms)} atoms) from Packmol output.")
