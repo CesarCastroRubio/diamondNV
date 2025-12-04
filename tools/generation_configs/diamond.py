@@ -84,11 +84,10 @@ class DiamondSphereGenerator:
             labeled.extend(self._extra_atoms)
     
         # === Compose XYZ file ===
-        L = 2.25*(2.0* r_angstrom)
+        L = 2.5*(2.0* r_angstrom)
         header = (
             f'Lattice="{L:.6f} 0.0 0.0  0.0 {L:.6f} 0.0  0.0 0.0 {L:.6f}" '
             f'Origin="{-L/2:.6f} {-L/2:.6f} {-L/2:.6f}" '
-            f'Crystal="Diamond" Bravais="FCC" SpaceGroup="227(Fd-3m)" '
             f'a={self.a:.4f}Å diameter={2.0*r_angstrom/10:.2f}nm'
         )
         lines = [str(len(labeled)), header]
@@ -127,7 +126,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     gen._surface_idx = set(under_idx)
     n_total = len(coords)
 
-    base_fraction = 28 / 67
+    base_fraction = 26 / 67
     scale_factor = 4.0 / r_angstrom
     target_OH = int(base_fraction * n_total * scale_factor)
     target_OH = max(3, min(target_OH, len(under_idx)))
@@ -310,16 +309,17 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
 
 
 def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
-    L = 2.25 * (2.0*r_angstrom)
+    L = 2.5 * (2.0*r_angstrom)
     molar_mass_H2O = 18.01528
     avogadro = 6.02214076e23
     angstrom3_to_cm3 = 1e-24
-    volume_cm3 = (L**3 - (4/3)*np.pi*r_angstrom**3) * angstrom3_to_cm3
-    mass_g = 1.0 * volume_cm3
+    buffer = 2.0
+    volume_cm3 = (L**3 - (4/3)*np.pi*(r_angstrom+buffer)**3) * angstrom3_to_cm3
+    mass_g = 1 * volume_cm3
     moles = mass_g / molar_mass_H2O
     N_H2O = int(round(moles * avogadro))
+    print(N_H2O)
 
-    buffer = 1.0
     core_xyz_path = "diamond_np.xyz"
     packmol_input_path = "packmol.inp"
     output_path = "diamond_water.xyz"
@@ -337,7 +337,7 @@ def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
             with open(water_xyz_path, "w") as f:
                 f.write(
                     "3\nWater\nO 0.000 0.000 0.000\n"
-                    "H 0.757 0.586 0.000\n"
+                    "H 0.757 a.586 0.000\n"
                     "H -0.757 0.586 0.000\n"
                 )
 
@@ -347,16 +347,14 @@ def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
 filetype xyz
 output {output_path}
 
-structure {core_xyz_path}
-  number 1
-  fixed 0. 0. 0. 0. 0. 0.
-end structure
-
+pbc {-L/2} {-L/2} {-L/2} {L/2} {L/2} {L/2}
 structure {water_xyz_path}
   number {N_H2O}
-  inside box {-L/2 + buffer} {-L/2 + buffer} {-L/2 + buffer} {L/2 - buffer} {L/2 - buffer} {L/2 - buffer}
-  outside sphere 0.0 0.0 0.0 {r_angstrom + buffer}
+  outside sphere 0.0 0.0 0.0 {r_angstrom+buffer}
+  radius 1.315
 end structure
+#end structure
+
 """)
 
     # === run Packmol silent ===
@@ -373,7 +371,7 @@ end structure
     with open(output_path) as f:
         lines = f.readlines()
     atom_lines = lines[2:]
-    water_lines = atom_lines[core_np_atoms:]
+    water_lines = atom_lines 
 
     water_atoms = []
     for line in water_lines:
@@ -384,7 +382,7 @@ end structure
             sym = "HW"
         water_atoms.append((sym, float(x), float(y), float(z)))
 
-    print(f"Parsed {len(water_atoms)//3} water molecules ({len(water_atoms)} atoms) from Packmol output.")
+    print(f"Parsed {len(water_atoms)//3} water molecules ({len(water_atoms)} atoms) from Packmol output in {volume_cm3/angstrom3_to_cm3:.2f} cubic angstrom")
 
     # === 6. attach waters to gen ===
     gen._extra_atoms = getattr(gen, "_extra_atoms", []) + water_atoms
