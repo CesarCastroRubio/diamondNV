@@ -89,7 +89,7 @@ class DiamondSphereGenerator:
             f'Lattice="{L:.6f} 0.0 0.0  0.0 {L:.6f} 0.0  0.0 0.0 {L:.6f}" '
             f'Origin="{-L/2:.6f} {-L/2:.6f} {-L/2:.6f}" '
             f'Crystal="Diamond" Bravais="FCC" SpaceGroup="227(Fd-3m)" '
-            f'a={self.a:.4f}Å diameter={L/20:.2f}nm'
+            f'a={self.a:.4f}Å diameter={2.0*r_angstrom/10:.2f}nm'
         )
         lines = [str(len(labeled)), header]
         lines += [f"{sym} {x:.6f} {y:.6f} {z:.6f}" for sym, x, y, z in labeled]
@@ -127,7 +127,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     gen._surface_idx = set(under_idx)
     n_total = len(coords)
 
-    base_fraction = 25 / 67
+    base_fraction = 28 / 67
     scale_factor = 4.0 / r_angstrom
     target_OH = int(base_fraction * n_total * scale_factor)
     target_OH = max(3, min(target_OH, len(under_idx)))
