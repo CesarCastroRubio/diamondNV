@@ -315,7 +315,7 @@ def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
     angstrom3_to_cm3 = 1e-24
     buffer = 2.0
     volume_cm3 = (L**3 - (4/3)*np.pi*(r_angstrom+buffer)**3) * angstrom3_to_cm3
-    mass_g = 1.1 * volume_cm3
+    mass_g = 1 * volume_cm3
     moles = mass_g / molar_mass_H2O
     N_H2O = int(round(moles * avogadro))
     print(N_H2O)
