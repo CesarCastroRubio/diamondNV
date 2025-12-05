@@ -98,7 +98,7 @@ class DiamondSphereGenerator:
     
 
 def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
-                                   ratio_OH_to_O=3.0,
+                                   ratio_OH_to_O=4.0,
                                    temperature=100.0):
     """
     Mixed hydroxyl/ether oxygen functionalization (reordered + minimal steric model)
@@ -126,7 +126,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     gen._surface_idx = set(under_idx)
     n_total = len(coords)
 
-    base_fraction = 26 / 67
+    base_fraction = 25 / 67
     scale_factor = 4.0 / r_angstrom
     target_OH = int(base_fraction * n_total * scale_factor)
     target_OH = max(3, min(target_OH, len(under_idx)))
