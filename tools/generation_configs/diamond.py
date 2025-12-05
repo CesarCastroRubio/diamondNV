@@ -84,7 +84,7 @@ class DiamondSphereGenerator:
             labeled.extend(self._extra_atoms)
     
         # === Compose XYZ file ===
-        L = 2.5*(2.0* r_angstrom)
+        L = 2.25*(2.0* r_angstrom)
         header = (
             f'Lattice="{L:.6f} 0.0 0.0  0.0 {L:.6f} 0.0  0.0 0.0 {L:.6f}" '
             f'Origin="{-L/2:.6f} {-L/2:.6f} {-L/2:.6f}" '
@@ -309,16 +309,15 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
 
 
 def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
-    L = 2.5 * (2.0*r_angstrom)
+    L = 2.25 * (2.0*r_angstrom)
     molar_mass_H2O = 18.01528
     avogadro = 6.02214076e23
     angstrom3_to_cm3 = 1e-24
     buffer = 2.0
     volume_cm3 = (L**3 - (4/3)*np.pi*(r_angstrom+buffer)**3) * angstrom3_to_cm3
-    mass_g = 1.0 * volume_cm3
-    moles = mass_g / molar_mass_H2O
-    N_H2O = int(round(moles * avogadro))
-    print(N_H2O)
+    #mass_g = 1.04 * volume_cm3
+    #moles = mass_g / molar_mass_H2O
+    N_H2O = 450 #int(round(moles * avogadro))
 
     core_xyz_path = "diamond_np.xyz"
     packmol_input_path = "packmol.inp"
