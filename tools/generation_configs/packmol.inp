@@ -1,11 +1,11 @@
 tolerance 2.0
 filetype xyz
 output diamond_water.xyz
-
 pbc -12.375 -12.375 -12.375 12.375 12.375 12.375
+
 structure water.xyz
   number 450
-  outside sphere 0.0 0.0 0.0 7.5
+  outside sphere 0.0 0.0 0.0 8.5
   radius 1.25
 end structure
 

@@ -65,38 +65,62 @@ class DiamondSphereGenerator:
             labeled.append((sym, x, y, z))
     
         # === Apply NV vacancy substitution ===
+    
         if NV_vacancy:
             eps = 1e-4
             z0 = self.a * np.sqrt(3 / 64)
             updated = []
+            
             for sym, x, y, z in labeled:
-                if abs(x) < eps and abs(y) < eps:
-                    if abs(z - z0) < eps:
-                        continue  # remove C at +z0 (vacancy)
-                    if abs(z + z0) < eps:
-                        updated.append(("N", x, y, z))  # replace with N
-                        continue
+                if abs(x) < eps and abs(y) < eps and abs(z + z0) < eps:
+                    continue
                 updated.append((sym, x, y, z))
-            labeled = updated
-    
-        # === Add any external atoms ===
-        if hasattr(self, "_extra_atoms"):
-            labeled.extend(self._extra_atoms)
-    
-        # === Compose XYZ file ===
-        L = 2.25*(2.0* r_angstrom)
-        header = (
-            f'Lattice="{L:.6f} 0.0 0.0  0.0 {L:.6f} 0.0  0.0 0.0 {L:.6f}" '
-            f'Origin="{-L/2:.6f} {-L/2:.6f} {-L/2:.6f}" '
-            f'a={self.a:.4f}Å diameter={2.0*r_angstrom/10:.2f}nm'
-        )
-        lines = [str(len(labeled)), header]
-        lines += [f"{sym} {x:.6f} {y:.6f} {z:.6f}" for sym, x, y, z in labeled]
-    
-        print(f"{len(labeled)} atoms at D={2*r_angstrom/10:.2f} nm")
-        return "\n".join(lines)
-    
+            
+            bond_vec = self.a * np.sqrt(3) / 4
+            neighbor_candidates = []
+            
+            for sym, x, y, z in updated:
+                dist = np.sqrt(x**2 + y**2 + (z + z0)**2)
+                if abs(dist - bond_vec) < 0.15 * self.a:
+                    neighbor_candidates.append((sym, x, y, z))
+            
+            if len(neighbor_candidates) > 0:
+                print
+                chosen_idx = random.randint(0, len(neighbor_candidates) - 1)
+                final = []
+                for i, (sym, x, y, z) in enumerate(updated):
+                    placed = False
+                    for j, (nsym, nx, ny, nz) in enumerate(neighbor_candidates):
+                        if abs(x - nx) < eps and abs(y - ny) < eps and abs(z - nz) < eps:
+                            if j == chosen_idx:
+                                final.append(("N", x, y, z))
+                            else:
+                                final.append((sym, x, y, z))
+                            placed = True
+                            break
+                    if not placed:
+                        final.append((sym, x, y, z))
+                labeled = final
+            else:
+                labeled = updated
 
+            # === Add any external atoms ===
+            if hasattr(self, "_extra_atoms"):
+                labeled.extend(self._extra_atoms)
+        
+            # === Compose XYZ file ===
+            L = 2.25*(2.0* r_angstrom)
+            header = (
+                f'Lattice="{L:.6f} 0.0 0.0  0.0 {L:.6f} 0.0  0.0 0.0 {L:.6f}" '
+                f'Origin="{-L/2:.6f} {-L/2:.6f} {-L/2:.6f}" '
+                f'a={self.a:.4f}Å diameter={2.0*r_angstrom/10:.2f}nm'
+            )
+            lines = [str(len(labeled)), header]
+            lines += [f"{sym} {x:.6f} {y:.6f} {z:.6f}" for sym, x, y, z in labeled]
+        
+            print(f"{len(labeled)} atoms at D={2*r_angstrom/10:.2f} nm")
+            return "\n".join(lines)
+    
 def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
                                    ratio_OH_to_O=4.0,
                                    temperature=100.0):
@@ -313,9 +337,9 @@ def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
     molar_mass_H2O = 18.01528
     avogadro = 6.02214076e23
     angstrom3_to_cm3 = 1e-24
-    buffer = 2.0
+    buffer = 3.0
     volume_cm3 = (L**3 - (4/3)*np.pi*(r_angstrom+buffer)**3) * angstrom3_to_cm3
-    #mass_g = 1.04 * volume_cm3
+    #mass_g = 1.00 * volume_cm3
     #moles = mass_g / molar_mass_H2O
     N_H2O = 450 #int(round(moles * avogadro))
 
@@ -345,8 +369,8 @@ def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
         f.write(f"""tolerance 2.0
 filetype xyz
 output {output_path}
-
 pbc {-L/2} {-L/2} {-L/2} {L/2} {L/2} {L/2}
+
 structure {water_xyz_path}
   number {N_H2O}
   outside sphere 0.0 0.0 0.0 {r_angstrom+buffer}
