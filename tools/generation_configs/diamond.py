@@ -123,7 +123,7 @@ class DiamondSphereGenerator:
     
 def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
                                    ratio_OH_to_O=4.0,
-                                   temperature=100.0):
+                                   temperature=1.0):
     """
     Mixed hydroxyl/ether oxygen functionalization (reordered + minimal steric model)
 
@@ -151,7 +151,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     n_total = len(coords)
 
     base_fraction = 25 / 67
-    scale_factor = 4.0 / r_angstrom
+    scale_factor = 4 / r_angstrom
     target_OH = int(base_fraction * n_total * scale_factor)
     target_OH = max(3, min(target_OH, len(under_idx)))
     target_O = int(target_OH / ratio_OH_to_O)
@@ -165,13 +165,25 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     two_coord_idx = [i for i in under_idx if ncoord[i] == 2]
     chosen_O = []
     if two_coord_idx:
-        weights_O = np.exp(-(C_SP3 - ncoord[two_coord_idx]) / max(temperature, 1e-3))
-        weights_O /= np.sum(weights_O)
-        chosen_O = np.random.choice(two_coord_idx,
-                                    size=min(target_O, len(two_coord_idx)),
-                                    replace=False, p=weights_O)
+        used_carbons_for_O = set()
+        shuffled = two_coord_idx[:]
+        random.shuffle(shuffled)
+    
+        for idx in shuffled:
+            if len(chosen_O) >= target_O:
+                break
+    
+            neigh = [n for n in bonded[idx] if n != idx]
+            if any(n in used_carbons_for_O for n in neigh):
+                continue
+    
+            chosen_O.append(idx)
+            used_carbons_for_O.update(neigh)
+    
         for idx in chosen_O:
             gen._replacements[idx] = "OS"
+            s, x, y, z = existing[idx]
+            existing[idx] = ("OS", x, y, z)
 
     # === Step 2: hydrogenation (no steric checks) ===
     count_H = 0
@@ -250,6 +262,7 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
     H_indices = [i for i, (s, *_) in enumerate(new_atoms) if s == "H"]
     random.shuffle(H_indices)
     count_OH = 0
+    visited_C = set()
 
     for hi in H_indices:
         if count_OH >= target_OH:
@@ -259,6 +272,10 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
         H_xyz = np.array(coords_H)
         dists = np.linalg.norm(coords - H_xyz, axis=1)
         nearest_C = np.argmin(dists)
+
+        if nearest_C in visited_C:
+            continue
+
         C_xyz = coords[nearest_C]
         CH_vec = H_xyz - C_xyz
         norm_CH = np.linalg.norm(CH_vec)
@@ -271,16 +288,18 @@ def oxygen_mixed_functionalization(gen, r_angstrom, bond_tol=0.2,
         # === reject if O too close to any existing H or O ===
         too_close_flag = False
         for s, x, y, z in existing:
-            if s not in ("H", "O"):
+            if s not in ("H", "O", "OS"):
                 continue
             if np.allclose([x, y, z], H_xyz, atol=1e-3):
                 continue
             d = np.linalg.norm(O_pos - np.array([x, y, z]))
-            if (s == "H" and d < 1.0) or (s == "O" and d < 1.2):
+            if (s == "H" and d < 1.0) or (s == "O" and d < 1.65) or (s == "OS" and d < 1.6):
                 too_close_flag = True
                 break
         if too_close_flag:
             continue
+
+        visited_C.add(nearest_C)
 
         # === orient OH hydrogen via angle sweep to maximize spacing ===
         theta = np.deg2rad(104.5)
@@ -339,9 +358,9 @@ def add_water_shell(gen, r_angstrom, N_H2O=10, water_xyz_path=None):
     angstrom3_to_cm3 = 1e-24
     buffer = 3.0
     volume_cm3 = (L**3 - (4/3)*np.pi*(r_angstrom+buffer)**3) * angstrom3_to_cm3
-    #mass_g = 1.00 * volume_cm3
-    #moles = mass_g / molar_mass_H2O
-    N_H2O = 450 #int(round(moles * avogadro))
+    mass_g = 1.00 * volume_cm3
+    moles = mass_g / molar_mass_H2O
+    N_H2O = int(round(moles * avogadro))
 
     core_xyz_path = "diamond_np.xyz"
     packmol_input_path = "packmol.inp"
