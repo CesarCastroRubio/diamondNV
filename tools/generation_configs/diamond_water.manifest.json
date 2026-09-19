@@ -1,0 +1,159 @@
+{
+  "config_hash": "b20309ea21e1",
+  "generated_utc": "2026-09-19T18:33:23+00:00",
+  "argv": [
+    "--diameter",
+    "1.0",
+    "--box",
+    "2.2",
+    "--seed",
+    "1",
+    "--shape",
+    "wulff",
+    "--wulff-ratio",
+    "0.99",
+    "--wulff-ratio-110",
+    "1.03",
+    "--additives",
+    "[TEMPOL.xyz]",
+    "--n-additives",
+    "[1]"
+  ],
+  "command": "python diamond.py --diameter 1.0 --box 2.2 --seed 1 --shape wulff --wulff-ratio 0.99 --wulff-ratio-110 1.03 --additives [TEMPOL.xyz] --n-additives [1]",
+  "inputs": {
+    "diameter": 1.0,
+    "lattice_constant": 3.567,
+    "rotate_111": true,
+    "nv_vacancy": true,
+    "shape": "wulff",
+    "wulff_ratio": 0.99,
+    "wulff_ratio_110": 1.03,
+    "prune_ch3": true,
+    "termination": "mixed",
+    "oh_o_ratio": 4.0,
+    "oh_base_fraction": 0.373134328358209,
+    "oh_scale_ref": 4.0,
+    "n_oh": null,
+    "n_o": null,
+    "bond_cc_cut": 1.7,
+    "bond_tol": 0.2,
+    "bond_ch": 1.09,
+    "bond_co": 1.43,
+    "bond_oh": 0.96,
+    "angle_hch": 109.5,
+    "angle_coh": 104.5,
+    "clash_oh": 1.0,
+    "clash_oo": 1.65,
+    "clash_oos": 1.6,
+    "n_water": 272,
+    "box": 2.2,
+    "water_density": 1.0,
+    "water_gap": 3.0,
+    "water_radius": 1.25,
+    "packmol_tolerance": 2.0,
+    "additive_margin": 1.0,
+    "seed": 1,
+    "additives": [
+      {
+        "tag": "TEMPOL",
+        "n": 1,
+        "n_atoms": 30,
+        "formula": "C9H18NO2"
+      }
+    ]
+  },
+  "derived": {
+    "radius_nm": 0.5,
+    "shape": "wulff",
+    "r111_angstrom": 4.74502400668514,
+    "r100_angstrom": 4.697573766618289,
+    "r110_angstrom": 4.887374726885695,
+    "size_metrics": {
+      "particle": {
+        "n_atoms": 175,
+        "rg_angstrom": 4.392325685984406,
+        "d_equiv_rg_nm": 1.1340936155291115,
+        "r_max_angstrom": 6.387708504292692,
+        "r_inscribed_angstrom": 4.719362606556421,
+        "com_offset_angstrom": 0.14560077084407438,
+        "gyration_eigenvalues": [
+          6.96733515051361,
+          6.4530827676986755,
+          5.872107013546095
+        ]
+      },
+      "core": {
+        "n_atoms": 86,
+        "rg_angstrom": 3.826176570417792,
+        "d_equiv_rg_nm": 0.9879145424584745,
+        "r_max_angstrom": 4.633668922933333,
+        "r_inscribed_angstrom": 3.7833748326989083,
+        "com_offset_angstrom": 0.055466455986942165,
+        "gyration_eigenvalues": [
+          4.9529645557279816,
+          4.861212022699349,
+          4.825450569586725
+        ]
+      }
+    },
+    "n_carbons_pruned": 0,
+    "n_atoms_wrapped": 54,
+    "box_length_nm": 2.2,
+    "box_length_angstrom": 22.0,
+    "box_source": "explicit",
+    "n_water_source": "derived_from_box",
+    "free_volume_angstrom3": 8142.816563107823,
+    "excluded_volume_angstrom3": 2144.660584850632,
+    "additive_volume_angstrom3": 360.52285204154566,
+    "exclusion_radius_angstrom": 8.0,
+    "solvent_density_g_cm3": 0.9992734916561863,
+    "system_density_g_cm3": 1.0285868348302531,
+    "system_mass_amu": 6595.685,
+    "elements": {
+      "C": 88,
+      "O": 305,
+      "N": 2,
+      "H": 626
+    }
+  },
+  "counts": {
+    "n_OH": 25,
+    "n_O": 6,
+    "n_H": 39,
+    "n_undercoordinated": 52,
+    "n_core": 87,
+    "target_OH": 25,
+    "target_O": 6,
+    "n_core_atoms": 175,
+    "n_water_packed": 272,
+    "n_additive_molecules": 1,
+    "n_additive_atoms": 30,
+    "n_total_atoms": 1021
+  },
+  "additives": [
+    {
+      "tag": "TEMPOL",
+      "path": "/Users/cesarcastro/junk/diamondNV/tools/generation_configs/TEMPOL.xyz",
+      "n": 1,
+      "n_atoms": 30,
+      "labels": [
+        "C_TEMPOL",
+        "H_TEMPOL",
+        "N_TEMPOL",
+        "O_TEMPOL"
+      ],
+      "formula": "C9H18NO2",
+      "volume_angstrom3": 360.52285204154566,
+      "mass_amu": 172.24800000000013,
+      "radius_angstrom": 3.500384247766322
+    }
+  ],
+  "outputs": {
+    "structure": "diamond_water.extxyz",
+    "core": "diamond_np.extxyz",
+    "packmol_input": "packmol.inp",
+    "solvent": "diamond_water_solvent.xyz",
+    "additive_packmol_input": "packmol_additives.inp",
+    "additive_structure": "diamond_water_additives.xyz"
+  }
+}

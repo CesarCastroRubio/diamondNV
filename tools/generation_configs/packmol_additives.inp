@@ -1,0 +1,11 @@
+tolerance 2.0
+seed 1
+filetype xyz
+output diamond_water_additives.xyz
+
+structure /Users/cesarcastro/junk/diamondNV/tools/generation_configs/TEMPOL.xyz
+  number 1
+  inside box -10.000000 -10.000000 -10.000000 10.000000 10.000000 10.000000
+  outside sphere 0.0 0.0 0.0 8.000000
+end structure
+
