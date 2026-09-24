@@ -602,7 +602,7 @@ def parse_float_list(tokens, flag):
     return values
 
 
-def apportion(weights, total):
+def apportion(weights, total, rng=None):
     w = np.array(weights, float)
     if (w < 0).any():
         die("--additive-ratios entries must be >= 0.")
@@ -610,8 +610,11 @@ def apportion(weights, total):
         die("--additive-ratios must contain at least one positive entry.")
     exact = w / w.sum() * total
     counts = np.floor(exact).astype(int)
-    for i in np.argsort(-(exact - counts), kind="stable")[:total - counts.sum()]:
-        counts[i] += 1
+    leftover = total - counts.sum()
+    if leftover:
+        jitter = np.zeros(len(w)) if rng is None else rng.random(len(w))
+        order = np.lexsort((jitter, -(exact - counts)))
+        counts[order[:leftover]] += 1
     return counts.tolist()
 
 
@@ -648,7 +651,8 @@ def resolve_additives(cfg):
                 "total, e.g. --additive-ratios [1,1,1,1] --n-additives 40.")
         if counts[0] < 0:
             die("--n-additives total must be >= 0.")
-        counts = apportion(ratios, counts[0])
+        counts = apportion(ratios, counts[0],
+                           np.random.default_rng([cfg.additive_seed, 0xC33]))
     else:
         if not counts:
             die("--additives was given without --n-additives; state a count per file, "
@@ -1367,6 +1371,15 @@ def main(argv=None):
             f"{cfg.water_radius:g}; packmol needs a positive radius for the fixed "
             f"nanoparticle.")
 
+    if cfg.seed is None:
+        cfg.seed = int.from_bytes(os.urandom(4), "big")
+        if not cfg.quiet:
+            print(f"No --seed given; drew seed {cfg.seed} for this realization.")
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed % (2 ** 32))
+    if cfg.additive_seed is None:
+        cfg.additive_seed = cfg.seed
+
     specs = resolve_additives(cfg)
     v_add = additive_volume(specs)
 
@@ -1401,14 +1414,6 @@ def main(argv=None):
     cfg.box = box_nm
     cfg = resolve_paths(cfg)
 
-    if cfg.seed is None:
-        cfg.seed = int.from_bytes(os.urandom(4), "big")
-        if not cfg.quiet:
-            print(f"No --seed given; drew seed {cfg.seed} for this realization.")
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed % (2 ** 32))
-    if cfg.additive_seed is None:
-        cfg.additive_seed = cfg.seed
 
     gen = DiamondCoreGenerator(
         shape=cfg.shape, wulff_ratio=cfg.wulff_ratio,
