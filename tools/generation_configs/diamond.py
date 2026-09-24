@@ -11,6 +11,8 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+# example: python diamond.py --diameter 1.1 --box 2.5 --seed 1 --shape wulff --wulff-ratio 0.99 --wulff-ratio-110 1.03 --additives [TEMPOL.xyz] --n-additives [1]
+
 import numpy as np
 from scipy.spatial import ConvexHull, HalfspaceIntersection, cKDTree
 
@@ -31,6 +33,7 @@ LABEL_TO_ELEMENT = {"C": "C", "CS": "C", "N": "N",
                     "O": "O", "OS": "O", "OW": "O",
                     "H": "H", "HW": "H"}
 CLASH_KEYS = {"H": "clash_oh", "O": "clash_oo", "OS": "clash_oos"}
+WATER_CHARGE = {"OW": -0.834, "HW": 0.417}
 
 FCC_FRAC = [(0.0, 0.0, 0.0), (0.0, 0.5, 0.5), (0.5, 0.0, 0.5), (0.5, 0.5, 0.0)]
 DIAMOND_BASIS = [(0.0, 0.0, 0.0), (0.25, 0.25, 0.25)]
@@ -589,6 +592,29 @@ def parse_int_list(tokens, flag):
     return values
 
 
+def parse_float_list(tokens, flag):
+    values = []
+    for t in flatten_list_arg(tokens) or []:
+        try:
+            values.append(float(t))
+        except ValueError:
+            die(f"{flag} got '{t}', which is not a number.")
+    return values
+
+
+def apportion(weights, total):
+    w = np.array(weights, float)
+    if (w < 0).any():
+        die("--additive-ratios entries must be >= 0.")
+    if w.sum() <= 0:
+        die("--additive-ratios must contain at least one positive entry.")
+    exact = w / w.sum() * total
+    counts = np.floor(exact).astype(int)
+    for i in np.argsort(-(exact - counts), kind="stable")[:total - counts.sum()]:
+        counts[i] += 1
+    return counts.tolist()
+
+
 def additive_tag(path):
     return os.path.splitext(os.path.basename(path))[0]
 
@@ -607,18 +633,33 @@ def molecule_volume(atoms):
 def resolve_additives(cfg):
     paths = flatten_list_arg(cfg.additives) or []
     counts = parse_int_list(cfg.n_additives, "--n-additives")
+    ratios = parse_float_list(cfg.additive_ratios, "--additive-ratios")
     if not paths:
-        if counts:
-            die("--n-additives was given without --additives.")
+        if counts or ratios:
+            die("--n-additives/--additive-ratios were given without --additives.")
         return []
-    if not counts:
-        die("--additives was given without --n-additives; state a count per file.")
-    if len(paths) != len(counts):
-        die(f"--additives lists {len(paths)} files but --n-additives lists "
-            f"{len(counts)} counts; they must match one-to-one.")
+
+    if ratios:
+        if len(ratios) != len(paths):
+            die(f"--additives lists {len(paths)} files but --additive-ratios lists "
+                f"{len(ratios)} weights; they must match one-to-one.")
+        if len(counts) != 1:
+            die("--additive-ratios sets the mix, so --n-additives must be a single "
+                "total, e.g. --additive-ratios [1,1,1,1] --n-additives 40.")
+        if counts[0] < 0:
+            die("--n-additives total must be >= 0.")
+        counts = apportion(ratios, counts[0])
+    else:
+        if not counts:
+            die("--additives was given without --n-additives; state a count per file, "
+                "or give --additive-ratios plus a single --n-additives total.")
+        if len(paths) != len(counts):
+            die(f"--additives lists {len(paths)} files but --n-additives lists "
+                f"{len(counts)} counts; they must match one-to-one.")
+        ratios = [None] * len(paths)
 
     specs = []
-    for path, n in zip(paths, counts):
+    for path, n, ratio in zip(paths, counts, ratios):
         if n < 0:
             die(f"--n-additives entry for '{path}' is negative.")
         tag = additive_tag(path)
@@ -631,6 +672,7 @@ def resolve_additives(cfg):
             "tag": tag,
             "path": os.path.abspath(path),
             "n": int(n),
+            "ratio": ratio,
             "n_atoms": len(atoms),
             "labels": [tagged_label(s, tag) for s, *_ in atoms],
             "formula": hill_formula({normalize_element(s): sum(
@@ -682,54 +724,85 @@ def packmol_header(cfg, box_length, out_path, pbc=True):
     return head + "\n"
 
 
-def pack_additives(cfg, r_excl, box_length, specs):
+def random_rotation(rng=None):
+    w, x, y, z = unit(np.random.randn(4) if rng is None else rng.standard_normal(4))
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def excluded_volume_mc(np_xyz, gap, box_length, samples=400000):
+    pts = np.random.uniform(-box_length / 2.0, box_length / 2.0, (samples, 3))
+    hit = cKDTree(np_xyz).query(pts, distance_upper_bound=gap)[0] < gap
+    return box_length ** 3 * hit.mean()
+
+
+def np_clearance_ok(cfg, m, r_excl, np_tree):
+    if cfg.exclusion == "atoms":
+        return np_tree.query(m)[0].min() >= cfg.surface_gap
+    return np.linalg.norm(m, axis=1).min() >= r_excl
+
+
+def pack_additives(cfg, r_excl, box_length, specs, np_atoms):
     half = box_length / 2.0 - cfg.additive_margin
     if half <= r_excl:
         die(f"--box leaves no room for additives: the {2 * r_excl:.2f} angstrom "
             f"exclusion sphere fills the cell once the {cfg.additive_margin:g} "
             f"angstrom additive margin is applied.")
-    box = (f"  inside box {-half:.6f} {-half:.6f} {-half:.6f} "
-           f"{half:.6f} {half:.6f} {half:.6f}\n")
-    body = "".join(
-        f"structure {s['path']}\n"
-        f"  number {s['n']}\n"
-        f"{box}"
-        f"  outside sphere 0.0 0.0 0.0 {r_excl:.6f}\n"
-        f"end structure\n\n"
-        for s in specs
-    )
-    atoms = run_packmol(cfg, cfg.additive_inp,
-                        packmol_header(cfg, box_length, cfg.additive_out, pbc=False) + body,
-                        cfg.additive_out, "additives")
 
-    expected = sum(s["n"] * s["n_atoms"] for s in specs)
-    if len(atoms) != expected:
-        die(f"packmol wrote {len(atoms)} additive atoms but {expected} were requested.")
+    np_tree = cKDTree(np.array([a[1:] for a in np_atoms], float))
+    order_rng = np.random.default_rng([cfg.additive_seed, 0xA11])
+    place_rng = np.random.default_rng([cfg.additive_seed, 0xB22])
 
-    overflow = np.abs(np.array([a[1:] for a in atoms])).max() - box_length / 2.0
-    if overflow > 0:
-        die(f"packmol pushed an additive atom {overflow:.3f} angstrom outside the "
-            f"cell; the water pass would reject it as a fixed structure.\n"
-            f"Raise --additive-margin above {cfg.additive_margin:g} angstrom, or "
-            f"enlarge --box.")
+    order = np.repeat(np.arange(len(specs)), [s["n"] for s in specs])
+    order_rng.shuffle(order)
+    bases = [np.array([a[1:] for a in read_xyz(s["path"])], float) for s in specs]
+    bases = [b - b.mean(axis=0) for b in bases]
 
-    labeled, i = [], 0
-    for s in specs:
-        for _ in range(s["n"]):
-            for label in s["labels"]:
-                labeled.append((label, *atoms[i][1:]))
-                i += 1
+    placed = np.zeros((0, 3))
+    labeled = []
+    for slot, si in enumerate(order):
+        s, base = specs[si], bases[si]
+        for _ in range(cfg.additive_attempts):
+            m = base @ random_rotation(place_rng).T + place_rng.uniform(-half, half, 3)
+            if np.abs(m).max() > half:
+                continue
+            if not np_clearance_ok(cfg, m, r_excl, np_tree):
+                continue
+            if len(placed) and cKDTree(placed).query(m)[0].min() < cfg.packmol_tolerance:
+                continue
+            placed = np.vstack([placed, m])
+            labeled += [(lab, *p) for lab, p in zip(s["labels"], m)]
+            break
+        else:
+            die(f"could not place {s['tag']} (slot {slot + 1} of {len(order)}) in "
+                f"{cfg.additive_attempts} random tries without a clash.\n"
+                f"Enlarge --box, lower --n-additives, or raise "
+                f"--additive-attempts above {cfg.additive_attempts}.")
+
+    write_text(cfg.additive_out, f"{len(labeled)}\nadditives\n" + "".join(
+        f"{label_element(lab)} {x:.6f} {y:.6f} {z:.6f}\n" for lab, x, y, z in labeled))
+
     if not cfg.quiet:
         summary = ", ".join(f"{s['n']} x {s['tag']}" for s in specs)
-        print(f"Packed additives ({summary}) into {len(labeled)} atoms")
+        r = np.linalg.norm(placed, axis=1)
+        print(f"Placed additives ({summary}) at random: {len(labeled)} atoms, "
+              f"{r.min():.2f}-{r.max():.2f} angstrom from the vacancy")
     return labeled
 
 
-def pack_water(cfg, r_excl, box_length, additive_atoms):
+def write_fixed_xyz(path, labeled):
+    write_text(path, f"{len(labeled)}\nfixed\n" + "".join(
+        f"{label_element(s)} {x:.6f} {y:.6f} {z:.6f}\n" for s, x, y, z in labeled))
+
+
+def pack_water(cfg, r_inner, box_length, additive_atoms, np_atoms):
     water_xyz = ensure_water_template(cfg.water_xyz, cfg.quiet)
     body = (f"structure {water_xyz}\n"
             f"  number {cfg.n_water}\n"
-            f"  outside sphere 0.0 0.0 0.0 {r_excl:.6f}\n"
+            f"  outside sphere 0.0 0.0 0.0 {r_inner:.6f}\n"
             f"  radius {cfg.water_radius}\n"
             f"end structure\n\n")
     if additive_atoms:
@@ -737,15 +810,24 @@ def pack_water(cfg, r_excl, box_length, additive_atoms):
                  f"  number 1\n"
                  f"  fixed 0. 0. 0. 0. 0. 0.\n"
                  f"end structure\n\n")
+    n_fixed = len(additive_atoms)
+    if cfg.exclusion == "atoms":
+        write_fixed_xyz(cfg.np_out, np_atoms)
+        body += (f"structure {cfg.np_out}\n"
+                 f"  number 1\n"
+                 f"  fixed 0. 0. 0. 0. 0. 0.\n"
+                 f"  radius {cfg.surface_gap - cfg.water_radius:.6f}\n"
+                 f"end structure\n\n")
+        n_fixed += len(np_atoms)
 
     atoms = run_packmol(cfg, cfg.packmol_inp,
                         packmol_header(cfg, box_length, cfg.packmol_out) + body,
                         cfg.packmol_out, "water")
 
     n_expected = 3 * cfg.n_water
-    if len(atoms) != n_expected + len(additive_atoms):
+    if len(atoms) != n_expected + n_fixed:
         die(f"packmol wrote {len(atoms)} atoms but {n_expected} water atoms plus "
-            f"{len(additive_atoms)} fixed additive atoms were expected.")
+            f"{n_fixed} fixed atoms were expected.")
 
     relabel = {"O": "OW", "H": "HW"}
     water_atoms = [(relabel.get(s, s), x, y, z) for s, x, y, z in atoms[:n_expected]]
@@ -755,18 +837,247 @@ def pack_water(cfg, r_excl, box_length, additive_atoms):
     return water_atoms
 
 
-def add_solvent_shell(gen, r_angstrom, cfg, box_length, specs):
-    r_excl = r_angstrom + cfg.water_gap
-    additive_atoms = pack_additives(cfg, r_excl, box_length, specs) if specs else []
-    water_atoms = pack_water(cfg, r_excl, box_length, additive_atoms) if cfg.n_water else []
+def water_template_frame(cfg):
+    atoms = read_xyz(ensure_water_template(cfg.water_xyz, cfg.quiet))
+    xyz = np.array([a[1:] for a in atoms], float)
+    order = np.argsort([0 if normalize_element(a[0]) == "O" else 1 for a in atoms])
+    xyz = xyz[order]
+    return xyz[1:] - xyz[0]
 
-    if not cfg.quiet and cfg.n_water:
-        free_v = box_length ** 3 - sphere_volume(r_excl) - additive_volume(specs)
-        print(f"Packed {cfg.n_water} water molecules ({len(water_atoms)} atoms) into "
-              f"{free_v:.2f} cubic angstrom of free volume")
+
+def kabsch(src, dst):
+    u, _, vt = np.linalg.svd(dst.T @ src)
+    d = np.sign(np.linalg.det(u @ vt))
+    return u @ np.diag([1.0, 1.0, d]) @ vt
+
+
+def water_hbonds(water_atoms):
+    W = np.array([a[1:] for a in water_atoms], float).reshape(-1, 3, 3)
+    return hbond_count(W[:, 0], W[:, 1:])
+
+
+def hbond_count(O, H):
+    tree = cKDTree(O)
+    n = 0
+    for i, hs in enumerate(H):
+        for h in hs:
+            for j in tree.query_ball_point(h, 2.5):
+                if j == i:
+                    continue
+                v1, v2 = O[i] - h, O[j] - h
+                if np.degrees(np.arccos(np.clip(
+                        v1 @ v2 / np.linalg.norm(v1) / np.linalg.norm(v2), -1, 1))) > 130:
+                    n += 2
+    return n / max(len(O), 1)
+
+
+def relax_water_orientations(water_atoms, blocker_xyz, cfg):
+    if cfg.water_relax_sweeps <= 0 or not water_atoms:
+        return water_atoms
+    W = np.array([a[1:] for a in water_atoms], float).reshape(-1, 3, 3)
+    O, H = W[:, 0], W[:, 1:]
+    h_local = water_template_frame(cfg)
+    q = np.array([WATER_CHARGE["HW"], WATER_CHARGE["HW"]])
+    q_env = np.array([WATER_CHARGE["OW"], WATER_CHARGE["HW"], WATER_CHARGE["HW"]])
+    tree = cKDTree(O)
+    blockers = cKDTree(blocker_xyz) if len(blocker_xyz) else None
+
+    for _ in range(cfg.water_relax_sweeps):
+        for i in np.random.permutation(len(O)):
+            neigh = [j for j in tree.query_ball_point(O[i], cfg.water_relax_cutoff)
+                     if j != i]
+            if not neigh:
+                continue
+            env = np.concatenate([np.concatenate([O[neigh][:, None, :], H[neigh]], axis=1)])
+            env_xyz = env.reshape(-1, 3)
+            env_q = np.tile(q_env, len(neigh))
+            trials = np.stack([np.eye(3)] + [random_rotation()
+                                             for _ in range(cfg.water_relax_trials)])
+            cand = O[i] + np.einsum("tab,hb->tha", trials, h_local)
+            d = np.linalg.norm(cand[:, :, None, :] - env_xyz[None, None, :, :], axis=3)
+            e = (q[None, :, None] * env_q[None, None, :] / np.maximum(d, 0.5)).sum((1, 2))
+            if blockers is not None:
+                floor = (cfg.surface_gap if cfg.exclusion == "atoms"
+                         else cfg.water_relax_clash)
+                e[blockers.query(cand.reshape(-1, 3))[0].reshape(len(trials), 2).min(1)
+                  < floor] = np.inf
+            best = int(np.argmin(e))
+            if np.isfinite(e[best]):
+                H[i] = cand[best]
+
+    out = []
+    for o, hs in zip(O, H):
+        out.append(("OW", *o))
+        out += [("HW", *h) for h in hs]
+    return out
+
+
+def ice_lattice_constant(density):
+    return (8.0 * MOLAR_MASS_H2O /
+            (AVOGADRO * density * ANGSTROM3_TO_CM3)) ** (1.0 / 3.0)
+
+
+def ice_cells(box_length, density):
+    return max(1, int(round(box_length / ice_lattice_constant(density))))
+
+
+def ice_water(cfg, r_excl, box_length, additive_atoms, np_atoms):
+    n_cells = ice_cells(box_length, cfg.water_density)
+    a = box_length / n_cells
+    motif = np.array([np.add(f, b) for f in FCC_FRAC for b in DIAMOND_BASIS])
+    rng = np.arange(n_cells)
+    cells = np.array(list(itertools.product(rng, rng, rng)), float)
+    O = ((cells[:, None, :] + motif[None, :, :]).reshape(-1, 3) * a) - box_length / 2.0
+
+    if cfg.exclusion == "atoms":
+        keep = cKDTree(np.array([a[1:] for a in np_atoms], float)).query(
+            O)[0] >= cfg.surface_gap
+    else:
+        keep = np.linalg.norm(O, axis=1) >= r_excl
+    if additive_atoms:
+        keep &= cKDTree(np.array([a[1:] for a in additive_atoms], float)).query(
+            O)[0] >= cfg.packmol_tolerance
+    O = O[keep]
+
+    if not len(O):
+        die(f"--water-model ice leaves no lattice site outside the "
+            f"{r_excl:.2f} angstrom exclusion sphere; enlarge --box.")
+
+    d_oo = a * np.sqrt(3.0) / 4.0
+    L = float(box_length)
+    pairs = cKDTree((O + L / 2.0) % L, boxsize=L).query_pairs(
+        d_oo * 1.15, output_type="ndarray")
+
+    def bond_dir(src, dst):
+        delta = O[dst] - O[src]
+        return unit(delta - L * np.round(delta / L))
+
+    degree = np.bincount(pairs.ravel(), minlength=len(O))
+    target = np.minimum(degree, 2)
+    donor = np.random.rand(len(pairs)) < 0.5
+
+    def donations(donor):
+        d = np.zeros(len(O), int)
+        np.add.at(d, pairs[donor, 0], 1)
+        np.add.at(d, pairs[~donor, 1], 1)
+        return d
+
+    d = donations(donor)
+    for _ in range(cfg.ice_repair_sweeps):
+        over = np.flatnonzero(d > target)
+        if not len(over):
+            break
+        fwd = [[] for _ in range(len(O))]
+        for e, (i, j) in enumerate(pairs):
+            src, dst = (i, j) if donor[e] else (j, i)
+            fwd[src].append((e, dst))
+        augmented = False
+        for s in over:
+            prev, queue, found = {int(s): None}, [int(s)], None
+            while queue and found is None:
+                u = queue.pop(0)
+                for e, v in fwd[u]:
+                    if v in prev:
+                        continue
+                    prev[v] = (u, e)
+                    if d[v] < target[v]:
+                        found = v
+                        break
+                    queue.append(v)
+            if found is None:
+                continue
+            d[found] += 1
+            d[s] -= 1
+            v = found
+            while prev[v] is not None:
+                u, e = prev[v]
+                donor[e] = not donor[e]
+                v = u
+            augmented = True
+            break
+        if not augmented:
+            break
+    satisfied = float((d == target).mean())
+
+    out_dirs = [[] for _ in range(len(O))]
+    for e, (i, j) in enumerate(pairs):
+        src, dst = (i, j) if donor[e] else (j, i)
+        if len(out_dirs[src]) < 2:
+            out_dirs[src].append(bond_dir(src, dst))
+
+    h_local = water_template_frame(cfg)
+    h_dirs = np.array([unit(v) for v in h_local])
+    blocked = np.array([a[1:] for a in np_atoms] + [a[1:] for a in additive_atoms], float)
+    blockers = cKDTree(blocked) if len(blocked) else None
+    gap = cfg.surface_gap if cfg.exclusion == "atoms" else 0.0
+    water_atoms, reoriented = [], 0
+
+    for i, o in enumerate(O):
+        dirs = out_dirs[i]
+        while len(dirs) < 2:
+            v = np.random.randn(3)
+            for u in dirs:
+                v -= (v @ u) * u
+            dirs = dirs + [unit(v)]
+        target = np.array(dirs[:2])
+        R = kabsch(h_dirs, target)
+        H = o + h_local @ R.T
+        if blockers is not None and gap and blockers.query(H)[0].min() < gap:
+            cand = np.stack([random_rotation() for _ in range(128)])
+            pos = o + np.einsum("tab,hb->tha", cand, h_local)
+            ok = blockers.query(pos.reshape(-1, 3))[0].reshape(len(cand), 2).min(1) >= gap
+            if ok.any():
+                score = np.einsum("tab,hb,ha->t", cand[ok], h_local / np.linalg.norm(
+                    h_local, axis=1)[:, None], target)
+                R = cand[ok][int(np.argmax(score))]
+                H = o + h_local @ R.T
+                reoriented += 1
+        water_atoms.append(("OW", *o))
+        water_atoms += [("HW", *h) for h in H]
+
+    if not cfg.quiet:
+        rho = (len(O) * MOLAR_MASS_H2O
+               / (AVOGADRO * (box_length ** 3 - sphere_volume(r_excl))
+                  * ANGSTROM3_TO_CM3))
+        print(f"Ice Ic lattice: a {a:.4f} A ({n_cells} cells per edge), "
+              f"O-O {d_oo:.3f} A, {len(O)} waters at {rho:.4f} g/cm^3, "
+              f"ice rules satisfied on {100 * satisfied:.1f}% of sites, "
+              f"H-bonds per water {water_hbonds(water_atoms):.2f}")
+    return water_atoms
+
+
+def add_solvent_shell(gen, r_angstrom, cfg, box_length, specs, np_atoms):
+    r_excl = r_angstrom + cfg.water_gap
+    r_inner = (gen.metrics.get("core", {}) or {}).get("r_inscribed_angstrom", r_angstrom)
+    r_inner = r_inner if cfg.exclusion == "atoms" else r_excl
+    additive_atoms = (pack_additives(cfg, r_excl, box_length, specs, np_atoms)
+                      if specs else [])
+
+    water_atoms = []
+    if cfg.n_water:
+        if cfg.water_model == "ice":
+            water_atoms = ice_water(cfg, r_excl, box_length, additive_atoms, np_atoms)
+        else:
+            water_atoms = pack_water(cfg, r_inner, box_length, additive_atoms, np_atoms)
+            if not cfg.quiet:
+                free_v = box_length ** 3 - additive_volume(specs) - (
+                    excluded_volume_mc(np.array([a[1:] for a in np_atoms], float),
+                                       cfg.surface_gap, box_length)
+                    if cfg.exclusion == "atoms" else sphere_volume(r_excl))
+                print(f"Packed {cfg.n_water} water molecules ({len(water_atoms)} atoms) "
+                      f"into {free_v:.2f} cubic angstrom of free volume")
+            blockers = np.array([a[1:] for a in np_atoms] +
+                                [a[1:] for a in additive_atoms], float) \
+                if (np_atoms or additive_atoms) else np.zeros((0, 3))
+            before = water_hbonds(water_atoms)
+            water_atoms = relax_water_orientations(water_atoms, blockers, cfg)
+            if not cfg.quiet and cfg.water_relax_sweeps > 0:
+                print(f"Relaxed water orientations over {cfg.water_relax_sweeps} sweeps: "
+                      f"H-bonds per water {before:.2f} -> "
+                      f"{water_hbonds(water_atoms):.2f}")
 
     gen._extra_atoms = list(gen._extra_atoms) + additive_atoms + water_atoms
-    return gen, cfg.n_water, additive_atoms
+    return gen, len(water_atoms) // 3, additive_atoms
 
 
 def build_parser():
@@ -838,6 +1149,14 @@ def build_parser():
                         "it from --n-water. At least one of --box / --n-water is required")
     g.add_argument("--water-density", type=float, default=1.0,
                    help="solvent density in g/cm^3 used to derive the box")
+    g.add_argument("--exclusion", choices=["atoms", "sphere"], default="atoms",
+                   help="atoms = keep solvent --surface-gap away from every "
+                        "nanoparticle atom, which follows facets and terminations; "
+                        "sphere = legacy single exclusion sphere of radius "
+                        "particle-radius + --water-gap")
+    g.add_argument("--surface-gap", type=float, default=2.0,
+                   help="min distance from any nanoparticle atom to any solvent or "
+                        "additive atom, in angstrom, when --exclusion atoms")
     g.add_argument("--water-gap", type=float, default=3.0,
                    help="solvent exclusion shell added to the particle radius, in "
                         "angstrom (packmol units)")
@@ -852,10 +1171,34 @@ def build_parser():
                         "the atom-label tag, e.g. DMSO.xyz -> S_DMSO, C_DMSO")
     g.add_argument("--n-additives", nargs="+", default=None, metavar="N",
                    help="molecule count per --additives entry, in the same order and "
-                        "the same list syntax, e.g. 1 1 or [1,1]")
+                        "the same list syntax, e.g. 1 1 or [1,1]. With "
+                        "--additive-ratios this is instead a single grand total")
+    g.add_argument("--additive-ratios", nargs="+", default=None, metavar="W",
+                   help="relative weights per --additives entry, any positive floats, "
+                        "renormalised to the --n-additives total by largest remainder, "
+                        "e.g. --additive-ratios [1,1,1,1] --n-additives 40")
+    g.add_argument("--additive-seed", type=int, default=None,
+                   help="seed for additive identity and placement only; defaults to "
+                        "--seed, and is independent of the particle realization")
     g.add_argument("--additive-margin", type=float, default=1.0,
                    help="keep additives this far inside the cell wall, in angstrom, so "
                         "the water pass can hold them fixed")
+    g.add_argument("--additive-attempts", type=int, default=20000,
+                   help="random placement tries per additive molecule before giving up")
+    g.add_argument("--water-model", choices=["liquid", "ice"], default="liquid",
+                   help="liquid = packmol positions with the orientations relaxed into "
+                        "a hydrogen-bond network; ice = cubic ice Ic lattice obeying "
+                        "the Bernal-Fowler rules, which must be melted")
+    g.add_argument("--water-relax-sweeps", type=int, default=4,
+                   help="orientation relaxation passes over the water; 0 disables")
+    g.add_argument("--water-relax-trials", type=int, default=96,
+                   help="candidate orientations tried per water per sweep")
+    g.add_argument("--water-relax-cutoff", type=float, default=6.0,
+                   help="neighbour cutoff for the orientation energy, in angstrom")
+    g.add_argument("--water-relax-clash", type=float, default=1.4,
+                   help="min distance from a relaxed water H to any non-water atom")
+    g.add_argument("--ice-repair-sweeps", type=int, default=20000,
+                   help="augmenting passes used to enforce the ice rules on the protons")
     g.add_argument("--water-xyz", default="water.xyz",
                    help="water template; written if missing")
     g.add_argument("--packmol-exe", default="packmol", help="packmol executable")
@@ -903,7 +1246,7 @@ def resolve_paths(cfg):
     cfg.manifest = cfg.manifest or (stem + ".manifest.json")
     cfg.packmol_out = stem + "_solvent.xyz"
     cfg.additive_out = stem + "_additives.xyz"
-    cfg.additive_inp = os.path.splitext(cfg.packmol_inp)[0] + "_additives.inp"
+    cfg.np_out = stem + "_np_fixed.xyz"
     return cfg
 
 
@@ -914,7 +1257,10 @@ PHYSICAL_KEYS = [
     "bond_cc_cut", "bond_tol", "bond_ch", "bond_co", "bond_oh",
     "angle_hch", "angle_coh", "clash_oh", "clash_oo", "clash_oos",
     "n_water", "box", "water_density", "water_gap", "water_radius",
-    "packmol_tolerance", "additive_margin", "seed",
+    "packmol_tolerance", "additive_margin", "additive_attempts",
+    "exclusion", "surface_gap", "additive_seed",
+    "water_model", "water_relax_sweeps", "water_relax_trials", "water_relax_cutoff",
+    "water_relax_clash", "ice_repair_sweeps", "seed",
 ]
 
 
@@ -1016,6 +1362,10 @@ def main(argv=None):
         die("--n-water must be >= 0.")
     if cfg.shape == "wulff" and min(cfg.wulff_ratio, cfg.wulff_ratio_110) <= 0:
         die("--wulff-ratio and --wulff-ratio-110 must be > 0.")
+    if cfg.exclusion == "atoms" and cfg.surface_gap <= cfg.water_radius:
+        die(f"--surface-gap {cfg.surface_gap:g} must exceed --water-radius "
+            f"{cfg.water_radius:g}; packmol needs a positive radius for the fixed "
+            f"nanoparticle.")
 
     specs = resolve_additives(cfg)
     v_add = additive_volume(specs)
@@ -1024,6 +1374,20 @@ def main(argv=None):
     r_excl = r + cfg.water_gap
     box_length, v_free, v_excl, box_source, n_water_source = resolve_cell(
         cfg, r, r_excl, v_add)
+
+    if cfg.water_model == "ice" and cfg.n_water:
+        n_cells = ice_cells(box_length, cfg.water_density)
+        snapped = n_cells * ice_lattice_constant(cfg.water_density)
+        if abs(snapped - box_length) > 1e-9:
+            sys.stderr.write(
+                f"NOTE: --water-model ice snapped the box from "
+                f"{box_length / NM_TO_ANGSTROM:.4f} to {snapped / NM_TO_ANGSTROM:.4f} nm "
+                f"so that {n_cells} ice cells tile it exactly at --water-density "
+                f"{cfg.water_density:g} g/cm^3.\n")
+            box_length = snapped
+            v_excl = sphere_volume(r_excl)
+            v_free = box_length ** 3 - v_excl - v_add
+            box_source += "+ice_snapped"
 
     box_nm = box_length / NM_TO_ANGSTROM
     rho_solvent = (effective_density(cfg.n_water, box_length, r, cfg.water_gap, v_add)
@@ -1043,23 +1407,8 @@ def main(argv=None):
             print(f"No --seed given; drew seed {cfg.seed} for this realization.")
     random.seed(cfg.seed)
     np.random.seed(cfg.seed % (2 ** 32))
-
-    inputs = physical_config(cfg, specs)
-    chash = config_hash(inputs)
-    prov = provenance_string(inputs, chash, cfg.manifest, box_source, n_water_source)
-
-    if not cfg.quiet:
-        box_note = "given explicitly" if box_source == "explicit" else "derived from water count"
-        n_note = "given explicitly" if n_water_source == "explicit" else "derived from box"
-        print(f"Box edge {box_nm:.4f} nm ({box_note}); "
-              f"{cfg.n_water} waters ({n_note})"
-              + (f" at {rho_solvent:.4f} g/cm^3 solvent density" if cfg.n_water > 0 else "")
-              + f"; config {chash}")
-        if specs:
-            print("Additives: " + ", ".join(
-                f"{s['n']} x {s['tag']} ({s['formula']}, {s['n_atoms']} atoms)"
-                for s in specs)
-                + f"; {v_add:.1f} cubic angstrom of van der Waals volume reserved")
+    if cfg.additive_seed is None:
+        cfg.additive_seed = cfg.seed
 
     gen = DiamondCoreGenerator(
         shape=cfg.shape, wulff_ratio=cfg.wulff_ratio,
@@ -1076,6 +1425,37 @@ def main(argv=None):
     if cfg.prune_ch3 and gen.n_pruned and not cfg.quiet:
         print(f"Pruned {gen.n_pruned} under-coordinated carbons before passivation.")
     print_termination(cfg, counts)
+
+    if cfg.exclusion == "atoms" and cfg.n_water:
+        core_xyz = np.array(gen.positions(r, rotate_111_to_z=cfg.rotate_111)
+                            + [a[1:] for a in gen._extra_atoms], float)
+        v_excl = excluded_volume_mc(core_xyz, cfg.surface_gap, box_length)
+        v_free = box_length ** 3 - v_excl - v_add
+        if n_water_source == "derived_from_box":
+            cfg.n_water = max(1, int(round(volume_to_n_water(v_free, cfg.water_density))))
+            n_water_source = "derived_from_box_atomwise"
+        rho_solvent = (cfg.n_water * MOLAR_MASS_H2O
+                       / (AVOGADRO * v_free * ANGSTROM3_TO_CM3))
+
+    inputs = physical_config(cfg, specs)
+    chash = config_hash(inputs)
+    prov = provenance_string(inputs, chash, cfg.manifest, box_source, n_water_source)
+
+    if not cfg.quiet:
+        box_note = "given explicitly" if box_source.startswith("explicit") else "derived from water count"
+        n_note = "given explicitly" if n_water_source == "explicit" else "derived from box"
+        print(f"Box edge {box_nm:.4f} nm ({box_note}); "
+              f"{cfg.n_water} waters ({n_note})"
+              + (f" at {rho_solvent:.4f} g/cm^3 solvent density" if cfg.n_water > 0 else "")
+              + f"; config {chash}")
+        if specs:
+            total = sum(s["n"] for s in specs)
+            print("Additives: " + ", ".join(
+                f"{s['n']} x {s['tag']}"
+                + (f" ({s['n'] / total:.3f} of {total}, asked {s['ratio']:g})"
+                   if s["ratio"] is not None else f" ({s['formula']})")
+                for s in specs)
+                + f"; {v_add:.1f} cubic angstrom of van der Waals volume reserved")
 
     def print_size(gen):
         mp, mc = gen.metrics.get("particle"), gen.metrics.get("core")
@@ -1099,8 +1479,10 @@ def main(argv=None):
     write_text(cfg.core_out, core_str)
     n_packed, additive_atoms = 0, []
     if cfg.n_water > 0 or specs:
+        np_atoms = [(l.split()[0], *[float(v) for v in l.split()[1:4]])
+                    for l in core_str.splitlines()[2:] if l.split()]
         gen, n_packed, additive_atoms = add_solvent_shell(
-            gen, r, cfg, box_length, specs)
+            gen, r, cfg, box_length, specs, np_atoms)
 
     final_str = gen.to_xyz(r, box_length, wrap=cfg.wrap, **xyz_kwargs)
     n_total_atoms = len(final_str.splitlines()) - 2
@@ -1108,6 +1490,14 @@ def main(argv=None):
     if cfg.wrap and gen.n_wrapped and not cfg.quiet:
         print(f"Wrapped {gen.n_wrapped} atoms into the periodic cell "
               f"[{-box_nm / 2:.4f}, {box_nm / 2:.4f}] nm on each axis.")
+
+    if n_packed != cfg.n_water:
+        if not cfg.quiet:
+            print(f"--water-model {cfg.water_model} set the water count from the "
+                  f"lattice: {n_packed} waters, not the {cfg.n_water} the box and "
+                  f"--water-density implied.")
+        cfg.n_water = n_packed
+        rho_solvent = effective_density(n_packed, box_length, r, cfg.water_gap, v_add)
 
     elements, mass_amu = system_composition(final_str)
     rho_system = system_density(mass_amu, box_length)
@@ -1151,7 +1541,6 @@ def main(argv=None):
             "core": cfg.core_out,
             "packmol_input": cfg.packmol_inp if cfg.n_water > 0 else None,
             "solvent": cfg.packmol_out if cfg.n_water > 0 else None,
-            "additive_packmol_input": cfg.additive_inp if specs else None,
             "additive_structure": cfg.additive_out if specs else None,
         },
     }

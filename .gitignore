@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# generated structures, packmol scratch and run records
+*.xyz
+*.extxyz
+*.manifest.json
+*.inp
+
+# solvent/additive templates are inputs, not artifacts
+!water.xyz
+!DMSO.xyz
+!TEMPOL.xyz
+!TEMPOL_syn.xyz
+!TEMPOL_anti.xyz
