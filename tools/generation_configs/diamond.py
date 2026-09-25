@@ -916,6 +916,161 @@ def relax_water_orientations(water_atoms, blocker_xyz, cfg):
     return out
 
 
+def resolve_water_box(path):
+    if os.path.exists(path) or os.path.isabs(path):
+        return path
+    beside = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    return beside if os.path.exists(beside) else path
+
+
+def read_water_box(path):
+    path = resolve_water_box(path)
+    try:
+        lines = open(path).read().splitlines()
+    except OSError as exc:
+        die(f"cannot read --water-box '{path}': {exc}\n"
+            f"A pre-equilibrated box is required for --water-model equilibrated_liquid.\n"
+            f"The standard "
+            f"one is spc216.gro from the GROMACS distribution:\n"
+            f"  curl -O https://gitlab.com/gromacs/gromacs/-/raw/main/share/top/spc216.gro")
+
+    if path.lower().endswith(".gro"):
+        n = int(lines[1].split()[0])
+        box = np.array([float(v) for v in lines[2 + n].split()[:3]]) * NM_TO_ANGSTROM
+        sym = [lines[2 + i][10:15].strip() for i in range(n)]
+        xyz = np.array([[float(lines[2 + i][c:c + 8]) for c in (20, 28, 36)]
+                        for i in range(n)]) * NM_TO_ANGSTROM
+    else:
+        atoms = read_xyz(path)
+        m = re.search(r'Lattice="([^"]+)"', lines[1])
+        if not m:
+            die(f"--water-box '{path}' has no Lattice=\"...\" in its comment line, so "
+                f"its periodic box is unknown. Use a .gro box instead.")
+        v = [float(x) for x in m.group(1).split()]
+        box = np.array([v[0], v[4], v[8]])
+        sym = [a[0] for a in atoms]
+        xyz = np.array([a[1:] for a in atoms], float)
+
+    el = [label_element(s) or (s[:1].upper() if s[:1].upper() in ATOMIC_MASS else None)
+          for s in sym]
+    if len(el) % 3 or el[::3] != ["O"] * (len(el) // 3) \
+            or set(el[1::3]) | set(el[2::3]) != {"H"}:
+        die(f"--water-box '{path}' is not a plain O,H,H-ordered water box "
+            f"(first atoms parsed as {el[:6]}).")
+    W = xyz.reshape(-1, 3, 3)
+    return W[:, 0] % box, W[:, 1:] - W[:, :1], box
+
+
+def tiled_water(cfg, r_excl, box_length, additive_atoms, np_atoms):
+    # spc216.gro: 216-molecule SPC water box equilibrated at 300 K, from GROMACS
+    # share/top; SPC model of Berendsen, Postma, van Gunsteren & Hermans,
+    # "Interaction models for water in relation to protein hydration",
+    # in Intermolecular Forces (Reidel, 1981) 331-342.
+    O_src, H_src, box_src = read_water_box(cfg.water_box)
+    L = float(box_length)
+
+    rho_src = (len(O_src) * MOLAR_MASS_H2O
+               / (AVOGADRO * np.prod(box_src) * ANGSTROM3_TO_CM3))
+    scale = (rho_src / cfg.water_density) ** (1.0 / 3.0)
+    requested = scale
+    best = None
+    for _ in range(12):
+        got = _tile_once(cfg, r_excl, L, additive_atoms, np_atoms,
+                         O_src * scale, H_src, box_src * scale)
+        best = got
+        if cfg.n_water <= got[2] <= cfg.n_water * 1.15:
+            break
+        scale *= (max(got[2], 1) / cfg.n_water) ** (1.0 / 3.0)
+    return _finish_tiled(cfg, r_excl, L, best, scale, box_src, len(O_src),
+                         rho_src, requested)
+
+
+def _tile_once(cfg, r_excl, L, additive_atoms, np_atoms, O_src, H_src, src_box,
+               seam=True):
+    lo = np.floor(-L / 2.0 / src_box).astype(int)
+    hi = np.floor(L / 2.0 / src_box).astype(int)
+    grid = [np.arange(lo[a], hi[a] + 1) for a in range(3)]
+    reps = np.array([len(g) for g in grid])
+    shifts = np.array(list(itertools.product(*grid)), float) * src_box
+    O = (O_src[None, :, :] + shifts[:, None, :]).reshape(-1, 3)
+    Hrel = np.tile(H_src, (len(shifts), 1, 1))
+
+    keep = np.abs(O).max(axis=1) < L / 2.0
+    O, Hrel = O[keep], Hrel[keep]
+    n_tiled = len(O)
+
+    h_local = water_template_frame(cfg)
+    h_dirs = h_local / np.linalg.norm(h_local, axis=1)[:, None]
+    H = np.stack([o + h_local @ kabsch(h_dirs,
+                                      hr / np.linalg.norm(hr, axis=1)[:, None]).T
+                  for o, hr in zip(O, Hrel)])
+
+    mol = np.concatenate([O[:, None, :], H], axis=1).reshape(-1, 3)
+    per_mol = lambda d: d.reshape(-1, 3).min(axis=1)
+    if cfg.exclusion == "atoms":
+        keep = per_mol(cKDTree(np.array([a[1:] for a in np_atoms], float)).query(mol)[0]
+                       ) >= cfg.surface_gap
+    else:
+        keep = per_mol(np.linalg.norm(mol, axis=1)) >= r_excl
+    if additive_atoms:
+        keep &= per_mol(cKDTree(np.array([a[1:] for a in additive_atoms],
+                                         float)).query(mol)[0]) >= cfg.packmol_tolerance
+    O, H = O[keep], H[keep]
+    n_carved = len(O)
+
+    drop = set()
+    if seam:
+        for i, j in cKDTree((O + L / 2.0) % L, boxsize=L).query_pairs(
+                cfg.water_box_clash, output_type="ndarray"):
+            if i not in drop and j not in drop:
+                drop.add(int(j))
+    if drop:
+        mask = np.ones(len(O), bool)
+        mask[list(drop)] = False
+        O, H = O[mask], H[mask]
+    return O, H, len(O), (n_tiled, n_carved, len(drop), reps)
+
+
+def _finish_tiled(cfg, r_excl, L, got, scale, box_src, n_src, rho_src, requested):
+    O, H, n_kept, (n_tiled, n_carved, n_seam, reps) = got
+    if cfg.n_water < n_kept:
+        wrapped = (O + L / 2.0) % L
+        tight = cKDTree(wrapped, boxsize=L).query(wrapped, k=2)[0][:, 1]
+        clashing = np.flatnonzero(tight < cfg.water_box_clash + 0.3)
+        clashing = clashing[np.argsort(tight[clashing], kind="stable")]
+        rest = np.random.permutation(np.setdiff1d(np.arange(n_kept), clashing))
+        drop = np.concatenate([clashing, rest])[:n_kept - cfg.n_water]
+        keep = np.setdiff1d(np.arange(n_kept), drop)
+        O, H = O[keep], H[keep]
+
+    water_atoms = []
+    for o, hs in zip(O, H):
+        water_atoms.append(("OW", *o))
+        water_atoms += [("HW", *h) for h in hs]
+
+    if not cfg.quiet:
+        print(f"Tiled {os.path.basename(cfg.water_box)}: {n_src} waters at "
+              f"{rho_src:.4f} g/cm^3, affine x{scale:.5f} -> "
+              f"{rho_src / scale ** 3:.4f} g/cm^3, {'x'.join(map(str, reps))} cells, "
+              f"{n_tiled} placed, {n_tiled - n_carved} carved out, {n_seam} dropped "
+              f"across the periodic boundary, {len(O)} kept, "
+              f"H-bonds per water {water_hbonds(water_atoms):.2f}")
+        if abs(scale / requested - 1.0) > 1e-6:
+            delta = 100.0 * (scale / requested - 1.0)
+            sys.stderr.write(
+                f"NOTE: the tile was {'expanded' if delta > 0 else 'compressed'} "
+                f"{abs(delta):.2f}% past --water-density {cfg.water_density:g} g/cm^3 "
+                f"to reach {cfg.n_water} waters "
+                f"({rho_src / scale ** 3:.4f} g/cm^3 in the tile).\n")
+        if len(O) < cfg.n_water:
+            sys.stderr.write(
+                f"WARNING: --water-model tiled fitted {len(O)} of the {cfg.n_water} "
+                f"waters the box and --water-density imply, even at a tile density of "
+                f"{rho_src / scale ** 3:.4f} g/cm^3. The cell is under-filled; "
+                f"equilibrate in NPT or lower --water-density.\n")
+    return water_atoms
+
+
 def ice_lattice_constant(density):
     return (8.0 * MOLAR_MASS_H2O /
             (AVOGADRO * density * ANGSTROM3_TO_CM3)) ** (1.0 / 3.0)
@@ -1061,6 +1216,8 @@ def add_solvent_shell(gen, r_angstrom, cfg, box_length, specs, np_atoms):
     if cfg.n_water:
         if cfg.water_model == "ice":
             water_atoms = ice_water(cfg, r_excl, box_length, additive_atoms, np_atoms)
+        elif cfg.water_model == "equilibrated_liquid":
+            water_atoms = tiled_water(cfg, r_excl, box_length, additive_atoms, np_atoms)
         else:
             water_atoms = pack_water(cfg, r_inner, box_length, additive_atoms, np_atoms)
             if not cfg.quiet:
@@ -1189,10 +1346,18 @@ def build_parser():
                         "the water pass can hold them fixed")
     g.add_argument("--additive-attempts", type=int, default=20000,
                    help="random placement tries per additive molecule before giving up")
-    g.add_argument("--water-model", choices=["liquid", "ice"], default="liquid",
-                   help="liquid = packmol positions with the orientations relaxed into "
-                        "a hydrogen-bond network; ice = cubic ice Ic lattice obeying "
-                        "the Bernal-Fowler rules, which must be melted")
+    g.add_argument("--water-model", choices=["equilibrated_liquid", "liquid", "ice"], default="equilibrated_liquid",
+                   help="equilibrated_liquid = replicate a pre-equilibrated --water-box and carve the "
+                        "cavity out of it; liquid = packmol positions with the "
+                        "orientations relaxed into a hydrogen-bond network; ice = cubic "
+                        "ice Ic obeying the Bernal-Fowler rules, which must be melted")
+    g.add_argument("--water-box", default="spc216.gro",
+                   help="pre-equilibrated periodic water box for --water-model "
+                        "equilibrated_liquid; "
+                        ".gro, or extxyz carrying a Lattice= entry")
+    g.add_argument("--water-box-clash", type=float, default=2.2,
+                   help="O-O distance below which a tiled water is dropped at the "
+                        "periodic seam, in angstrom")
     g.add_argument("--water-relax-sweeps", type=int, default=4,
                    help="orientation relaxation passes over the water; 0 disables")
     g.add_argument("--water-relax-trials", type=int, default=96,
@@ -1263,7 +1428,7 @@ PHYSICAL_KEYS = [
     "n_water", "box", "water_density", "water_gap", "water_radius",
     "packmol_tolerance", "additive_margin", "additive_attempts",
     "exclusion", "surface_gap", "additive_seed",
-    "water_model", "water_relax_sweeps", "water_relax_trials", "water_relax_cutoff",
+    "water_model", "water_box_clash", "water_relax_sweeps", "water_relax_trials", "water_relax_cutoff",
     "water_relax_clash", "ice_repair_sweeps", "seed",
 ]
 
