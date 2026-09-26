@@ -144,6 +144,8 @@ class DiamondCoreGenerator:
         self.wulff_ratio = float(wulff_ratio)
         self.wulff_ratio_110 = float(wulff_ratio_110)
         self.metrics = {}
+        self.nv_sites = None
+        self.nv_info = {}
         self.prune_cutoff = prune_cutoff
         self.n_pruned = 0
         self.n_wrapped = 0
@@ -155,7 +157,15 @@ class DiamondCoreGenerator:
 
     @property
     def _vacancy(self):
-        return np.zeros(3)
+        return np.zeros(3) if self.nv_sites is None else self.nv_sites[0]
+
+    def apply_frame(self, frame):
+        if np.allclose(frame, np.eye(3)):
+            return
+        for key, atoms in list(self._pos_cache.items()):
+            self._pos_cache[key] = [tuple(p) for p in np.array(atoms, float) @ frame.T]
+        self._extra_atoms = [(s, *(frame @ np.array([x, y, z])))
+                             for s, x, y, z in self._extra_atoms]
 
     def facet_radii(self, r_angstrom):
         if self.shape == "sphere":
@@ -224,7 +234,12 @@ class DiamondCoreGenerator:
                 for i in range(len(atoms))]
         xyz = np.array(atoms, float) if atoms else np.zeros((0, 3))
 
-        if nv_vacancy and len(xyz):
+        if nv_vacancy and len(xyz) and self.nv_sites is not None:
+            vac, nit = self.nv_sites
+            keep = np.linalg.norm(xyz - vac, axis=1) > 1e-4 * np.sqrt(3)
+            xyz, syms = xyz[keep], [s for s, k in zip(syms, keep) if k]
+            syms[int(np.argmin(np.linalg.norm(xyz - nit, axis=1)))] = "N"
+        elif nv_vacancy and len(xyz):
             d = np.linalg.norm(xyz - self._vacancy, axis=1)
             keep = d > 1e-4 * np.sqrt(3)
             xyz, syms, d = xyz[keep], [s for s, k in zip(syms, keep) if k], d[keep]
@@ -262,6 +277,89 @@ class DiamondCoreGenerator:
         lines = [str(len(labeled)), header]
         lines += [f"{s} {x:.6f} {y:.6f} {z:.6f}" for s, x, y, z in labeled]
         return "\n".join(lines) + "\n"
+
+
+def bond_depths(P, cut):
+    pairs = cKDTree(P).query_pairs(cut, output_type="ndarray")
+    coord = np.bincount(pairs.ravel(), minlength=len(P))
+    nbr = [[] for _ in range(len(P))]
+    for i, j in pairs:
+        nbr[i].append(int(j))
+        nbr[j].append(int(i))
+    depth = np.full(len(P), -1)
+    frontier = [i for i in range(len(P)) if coord[i] < C_SP3]
+    depth[frontier] = 0
+    while frontier:
+        nxt = []
+        for i in frontier:
+            for j in nbr[i]:
+                if depth[j] < 0:
+                    depth[j] = depth[i] + 1
+                    nxt.append(j)
+        frontier = nxt
+    return depth, nbr
+
+
+def spin_about_z(target):
+    a = np.arctan2(target[1], target[0])
+    c, s = np.cos(-a), np.sin(-a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def plan_nv(gen, cfg, r_angstrom):
+    P = np.array(gen.positions(r_angstrom, rotate_111_to_z=cfg.rotate_111))
+    depth, nbr = bond_depths(P, cfg.bond_cc_cut + cfg.bond_tol)
+
+    if cfg.nv_r > 0:
+        theta = cfg.nv_theta if cfg.nv_theta is not None else random.uniform(0.0, 360.0)
+        phi = cfg.nv_phi if cfg.nv_phi is not None else \
+            np.degrees(np.arccos(random.uniform(-1.0, 1.0)))
+        t, p = np.deg2rad(theta), np.deg2rad(phi)
+        u = np.array([np.sin(p) * np.cos(t), np.sin(p) * np.sin(t), np.cos(p)])
+        cand = np.flatnonzero(depth >= cfg.nv_min_depth)
+        if not len(cand):
+            die(f"no lattice site is {cfg.nv_min_depth} bond shells below the surface "
+                f"for a {cfg.diameter:g} nm particle; lower --nv-min-depth or enlarge "
+                f"--diameter.")
+        reach = float((P[cand] @ u).max())
+        vac = int(cand[np.argmin(np.linalg.norm(P[cand] - cfg.nv_r * reach * u, axis=1))])
+    else:
+        theta = phi = 0.0
+        reach = 0.0
+        vac = int(np.argmin(np.linalg.norm(P, axis=1)))
+
+    neigh = nbr[vac]
+    if not neigh:
+        die("the chosen vacancy site has no bonded neighbour to host the nitrogen.")
+    if depth[vac] <= cfg.nv_min_depth:
+        shallowest = min(depth[j] for j in neigh)
+        pool = [j for j in neigh if depth[j] == shallowest]
+    else:
+        pool = neigh
+    nit = pool[random.randrange(len(pool))]
+
+    frame = np.eye(3)
+    if cfg.nv_align:
+        frame = rotation_to(P[nit] - P[vac], [0.0, 0.0, 1.0])
+        rest = [j for j in neigh if j != nit]
+        if rest:
+            carbon = rest[random.randrange(len(rest))]
+            v = frame @ (P[carbon] - P[vac])
+            frame = spin_about_z(v) @ frame
+
+    gen.apply_frame(frame)
+    gen.nv_sites = (frame @ P[vac], frame @ P[nit])
+    gen.nv_info = {
+        "requested_r": float(cfg.nv_r),
+        "theta_deg": float(theta),
+        "phi_deg": float(phi),
+        "reach_angstrom": reach,
+        "realized_r": float(np.linalg.norm(P[vac]) / reach) if reach else 0.0,
+        "offset_angstrom": float(np.linalg.norm(P[vac])),
+        "depth_shells": int(depth[vac]),
+        "nitrogen_depth_shells": int(depth[nit]),
+    }
+    return gen.nv_info
 
 
 def surface_analysis(gen, r_angstrom, rotate_111_to_z, bond_cc, bond_tol):
@@ -1273,6 +1371,24 @@ def build_parser():
                    help="create the NV centre (vacancy + substitutional N)")
     g.add_argument("--no-nv", dest="nv_vacancy", action="store_false",
                    help="leave a pristine core with no NV centre")
+    g.add_argument("--nv-align", action="store_true",
+                   help="rotate the particle about the cell origin so the V->N bond "
+                        "lies on +z and +x points at one of the three remaining "
+                        "vacancy-neighbour carbons (the C3v frame)")
+    g.add_argument("--nv-r", type=float, default=0.0,
+                   help="vacancy offset from the ideal centre as a fraction of the "
+                        "travel available along --nv-theta/--nv-phi; 0 is the centre, "
+                        "1 is the shallowest site still --nv-min-depth shells deep")
+    g.add_argument("--nv-theta", type=float, default=None,
+                   help="azimuth of the vacancy offset in degrees, measured from +x; "
+                        "drawn from --seed if omitted")
+    g.add_argument("--nv-phi", type=float, default=None,
+                   help="polar angle of the vacancy offset in degrees from +z, 0 to "
+                        "180; drawn from --seed if omitted")
+    g.add_argument("--nv-min-depth", type=int, default=2,
+                   help="minimum bond-graph distance from the vacancy to the surface "
+                        "shell; at 2 the nitrogen is forced to the shallowest "
+                        "neighbour so the dangling carbons stay buried")
 
     g = p.add_argument_group("termination chemistry")
     g.add_argument("--termination", choices=["mixed", "h", "oh", "bare"], default="mixed",
@@ -1433,8 +1549,14 @@ PHYSICAL_KEYS = [
 ]
 
 
+NV_DEFAULTS = {"nv_align": False, "nv_r": 0.0, "nv_theta": None, "nv_phi": None,
+               "nv_min_depth": 2}
+
+
 def physical_config(cfg, specs=()):
     inputs = {k: getattr(cfg, k) for k in PHYSICAL_KEYS}
+    inputs.update({k: getattr(cfg, k) for k, v in NV_DEFAULTS.items()
+                   if getattr(cfg, k) != v})
     inputs["additives"] = [{"tag": s["tag"], "n": s["n"], "n_atoms": s["n_atoms"],
                             "formula": s["formula"]} for s in specs]
     return inputs
@@ -1591,6 +1713,15 @@ def main(argv=None):
         print(f"Wulff core: r111 {r111:.4f} A, r100 {r100:.4f} A, r110 {r110:.4f} A "
               f"(r100:r110:r111 {cfg.wulff_ratio:g}:{cfg.wulff_ratio_110:g}:1)")
 
+    if cfg.nv_align or cfg.nv_r > 0:
+        info = plan_nv(gen, cfg, r)
+        if not cfg.quiet:
+            print(f"NV: R snapped to -> {info['realized_r']:.4f} from origin "
+                  f"({info['offset_angstrom']:.3f} A at theta {info['theta_deg']:.2f} "
+                  f"deg, phi {info['phi_deg']:.2f} deg), vacancy {info['depth_shells']} "
+                  f"shells deep, nitrogen {info['nitrogen_depth_shells']}"
+                  + (", V->N on +z" if cfg.nv_align else ""))
+
     gen, counts = functionalize_surface(gen, r, cfg)
     if cfg.prune_ch3 and gen.n_pruned and not cfg.quiet:
         print(f"Pruned {gen.n_pruned} under-coordinated carbons before passivation.")
@@ -1687,6 +1818,7 @@ def main(argv=None):
             "size_metrics": gen.metrics,
             "n_carbons_pruned": int(gen.n_pruned),
             "n_atoms_wrapped": int(gen.n_wrapped),
+            "nv": gen.nv_info or None,
             "box_length_nm": box_nm,
             "box_length_angstrom": box_length,
             "box_source": box_source,
