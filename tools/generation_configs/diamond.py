@@ -470,6 +470,9 @@ def build_pattern(text, kind, alias, fraction, sites):
                 f"one, the surface atom it binds to; a group that takes the place of "
                 f"a carbon belongs in --substitution.")
         arms = sorted(n.GetIdx() for n in mol.GetAtomWithIdx(stars[0]).GetNeighbors())
+        if not arms:
+            die(f"{flag} entry '{text}': '*' is bonded to nothing. Write the group "
+                f"as a separate atom, e.g. '[*][H]' for a hydrogen, not '[*H]'.")
         if len(arms) > 3:
             die(f"{flag} entry '{text}': '*' has {len(arms)} groups bonded to it, so "
                 f"no connection point is left to hold it on the surface; three is "
@@ -604,8 +607,15 @@ def parse_patterns(cfg, kind, default=()):
     sites = resolve_attachments(cfg.functionalization_attachments, len(texts),
                                 "--functionalization-attachments") \
         if kind == "functionalization" else [None] * len(texts)
-    return [build_pattern(t, kind, a, f, s)
-            for t, a, f, s in zip(texts, aliases, fractions, sites)]
+    order = parse_int_list(getattr(cfg, f"{kind}_order"), f"--{kind}-order") \
+        or list(range(1, len(texts) + 1))
+    if sorted(order) != list(range(1, len(texts) + 1)):
+        die(f"--{kind}-order must give each of the {len(texts)} entries its turn, "
+            f"using each of 1 to {len(texts)} once, e.g. "
+            f"[{','.join(map(str, range(len(texts), 0, -1)))}].")
+    entries = [build_pattern(t, kind, a, f, s)
+               for t, a, f, s in zip(texts, aliases, fractions, sites)]
+    return [e for _, e in sorted(zip(order, entries), key=lambda pair: pair[0])]
 
 
 def best_clear(env, e, pts, exclude, scale):
@@ -644,43 +654,37 @@ def substitute(p, surf, env, entries, cfg, rng):
         pools.setdefault(e["stars"], [i for i in surf.carbons
                                       if p.coord[i] == e["stars"] and i not in protected])
         e["eligible"] = len(pools[e["stars"]])
-    zone = set()
-    for leftover in (False, True):
-        active = [k for k, e in enumerate(entries) if (e["fraction"] is None) == leftover]
-        demand = {m: sum(entries[k]["requested"] for k in active if entries[k]["stars"] == m)
-                  for m in pools}
-        for m in sorted((m for m in pools if demand[m]),
-                        key=lambda m: len(pools[m]) / demand[m]):
-            members = [k for k in active if entries[k]["stars"] == m]
-            slots = np.repeat(members, [entries[k]["requested"] for k in members])
-            rng.shuffle(slots)
-            cursor = 0
-            for site in (rng.permutation(pools[m]) if pools[m] else []):
-                if cursor == len(slots):
-                    break
-                site, e = int(site), entries[slots[cursor]]
-                if site in zone:
-                    e["spaced_out"] += 1
-                    continue
-                placed = orient_substituents(p, surf, env, e, site, cfg.contact_scale)
-                if placed is None:
-                    e["rejected"] += 1
-                    continue
-                p.labels[site] = e["anchor_label"]
-                env.radii[site] = VDW_RADIUS[e["anchor_element"]]
-                taken = {max(surf.of[site], key=lambda b: surf.dirs[b] @ (x - p.xyz[site]))
-                         for x in placed[e["shell"]]}
-                spare = [b for b in surf.of[site] if b not in taken][:e["free"]]
-                for bond in surf.of[site]:
-                    if bond not in spare:
-                        surf.state[bond] = GONE
-                        env.alive[env.n_lattice + bond] = False
-                if len(placed):
-                    env.add(placed, e["radii"], ~e["heavy"])
-                    p.groups += [(lab, *xyz) for lab, xyz in zip(e["labels"], placed)]
-                zone |= p.ball(site, cfg.substitution_spacing - 1)
-                e["placed"] += 1
-                cursor += 1
+    zone, taken_sites = set(), set()
+    for e in entries:
+        pool = pools[e["stars"]]
+        for site in (rng.permutation(pool) if pool else []):
+            if e["placed"] == e["requested"]:
+                break
+            site = int(site)
+            if site in taken_sites:
+                continue
+            if site in zone:
+                e["spaced_out"] += 1
+                continue
+            placed = orient_substituents(p, surf, env, e, site, cfg.contact_scale)
+            if placed is None:
+                e["rejected"] += 1
+                continue
+            p.labels[site] = e["anchor_label"]
+            env.radii[site] = VDW_RADIUS[e["anchor_element"]]
+            taken = {max(surf.of[site], key=lambda b: surf.dirs[b] @ (x - p.xyz[site]))
+                     for x in placed[e["shell"]]}
+            spare = [b for b in surf.of[site] if b not in taken][:e["free"]]
+            for bond in surf.of[site]:
+                if bond not in spare:
+                    surf.state[bond] = GONE
+                    env.alive[env.n_lattice + bond] = False
+            if len(placed):
+                env.add(placed, e["radii"], ~e["heavy"])
+                p.groups += [(lab, *xyz) for lab, xyz in zip(e["labels"], placed)]
+            zone |= p.ball(site, cfg.substitution_spacing - 1)
+            taken_sites.add(site)
+            e["placed"] += 1
     return n_sites
 
 
@@ -710,27 +714,23 @@ def functionalize(p, surf, env, entries, cfg, rng):
     for e, cap in zip(entries, allot([e["fraction"] for e in entries], len(free))):
         e["requested"] = cap
         e["placed"] = e["rejected"] = 0
-        e["turn"] = (e["fraction"] is None, -int(e["heavy"].sum()), -len(e["elements"]))
         fits = [i for i, el in element.items()
                 if (not e["sites"] or el in e["sites"]) and len(spare(i)) >= e["bonds"]]
         e["eligible"] = len(fits) if e["bonds"] > 1 else sum(len(spare(i)) for i in fits)
     turns = np.linspace(0.0, 2.0 * np.pi, AZIMUTHS, endpoint=False)
     crowded = set()
 
-    for turn in sorted({e["turn"] for e in entries}):
-        members = [k for k, e in enumerate(entries) if e["turn"] == turn]
-        slots = np.repeat(members, [entries[k]["requested"] for k in members])
-        rng.shuffle(slots)
-        queues = {k: iter(rng.permutation(free)) for k in members}
-        for k in slots:
-            e = entries[k]
-            for b in queues[k]:
+    for e in entries:
+        queue = iter(rng.permutation(free))
+        bulky = bool(e["heavy"].any())
+        for _ in range(e["requested"]):
+            for b in queue:
                 b = int(b)
                 site = int(surf.site[b])
                 bonds = [b] if e["bonds"] == 1 else spare(site)[:e["bonds"]]
                 if (surf.state[b] != FREE or len(bonds) < e["bonds"] or b != bonds[0]
                         or (e["sites"] and element[site] not in e["sites"])
-                        or (turn[1] and site in crowded)):
+                        or (bulky and site in crowded)):
                     continue
                 placed = orient_group(
                     env, e, template(e, element[site]), p.xyz[site],
@@ -744,7 +744,7 @@ def functionalize(p, surf, env, entries, cfg, rng):
                     env.alive[env.n_lattice + x] = False
                 env.add(placed, e["radii"], ~e["heavy"])
                 p.groups += [(lab, *xyz) for lab, xyz in zip(e["labels"], placed)]
-                if turn[1]:
+                if bulky:
                     crowded.add(site)
                 e["placed"] += 1
                 break
@@ -1377,6 +1377,10 @@ def build_parser():
                         "exceeded. An array summing to more than 1 is rescaled to "
                         "sum to 1, and 'rest' in place of a number takes every site "
                         "the capped entries leave")
+    g.add_argument("--substitution-order", nargs="+", default=None, metavar="ARRAY",
+                   help="array giving each --substitution entry its turn: [2,1] "
+                        "places the second entry first. Earlier turns get first pick of the sites. "
+                        "Default is [1,2,...,n], the order written")
     g.add_argument("--substitution-alias", nargs="+", default=None, metavar="ARRAY",
                    help="array with one name per --substitution entry; its atoms are "
                         "labelled <element>_<name>, e.g. [ether] -> O_ether. Default "
@@ -1403,6 +1407,10 @@ def build_parser():
                         "entry: the undercoordinated atoms that group may bind, e.g. "
                         "[[C,N],[],[C]]. An empty array allows any, and leaving the "
                         "flag out is the same as every array empty")
+    g.add_argument("--functionalization-order", nargs="+", default=None, metavar="ARRAY",
+                   help="array giving each --functionalization entry its turn: [3,1,2] "
+                        "places the second entry first and the first last. Earlier turns get first pick of the sites. "
+                        "Default is [1,2,...,n], the order written")
     g.add_argument("--functionalization-alias", nargs="+", default=None, metavar="ARRAY",
                    help="array with one name per --functionalization entry, e.g. "
                         "[OH,H,Grotz] -> O_OH, H_OH, C_Grotz, H_Grotz. A lone hydrogen "
