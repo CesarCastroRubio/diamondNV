@@ -12,9 +12,11 @@ from datetime import datetime, timezone
 # example: python diamond.py --diameter 1.1 --box 2.5 --seed 1 --shape wulff --gamma-100 0.99 --gamma-110 1.03 --substitution ["*O*"] --substitution-ratio [0.1] --functionalization ["*O","*[H]"] --functionalization-ratio [0.3,rest] --additives [TEMPOL.xyz] --n-additives [1]
 
 import numpy as np
+import rdkit
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, rdMolDescriptors
 from scipy.spatial import ConvexHull, HalfspaceIntersection, cKDTree
+print(rdkit.__version__)
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -408,14 +410,21 @@ def condensed_formula(elements):
 
 def embed(mol, n_conf):
     ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=n_conf, randomSeed=EMBED_SEED))
+    closed = Chem.RWMol(mol)
+    for n in closed.GetAtoms():
+        for o in n.GetNeighbors():
+            if n.GetSymbol() == "N" and o.GetSymbol() == "O" and o.GetNumRadicalElectrons():
+                closed.GetBondBetweenAtoms(n.GetIdx(), o.GetIdx()).SetBondType(
+                    Chem.BondType.DOUBLE)
+                n.SetFormalCharge(1)
+                o.SetNumRadicalElectrons(0)
+    closed = closed.GetMol()
     try:
-        if AllChem.MMFFHasAllMoleculeParams(mol):
-            AllChem.MMFFOptimizeMoleculeConfs(mol, maxIters=2000)
-        else:
-            AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=2000)
+        Chem.SanitizeMol(closed)
+        AllChem.UFFOptimizeMoleculeConfs(closed, maxIters=2000)
     except Exception:
-        pass
-    return [mol.GetConformer(i).GetPositions() for i in ids]
+        return [mol.GetConformer(i).GetPositions() for i in ids]
+    return [closed.GetConformer(i).GetPositions() for i in ids]
 
 
 def stand_in(mol, stars, element, flag, text):
